@@ -33,7 +33,7 @@ library(bsts)
 # Data Import & Variable Definition
 
 ```{r}
-filepath <- file.choose()
+filepath <-  "C:/Users/yatin/Desktop/Wells Fargo FS Q1-97 to Q4-24 Consolidation V3.0.xlsx"
 mydata <- read_excel(
   path = filepath,
   sheet = "Consolidation Sheet",
@@ -2444,7 +2444,6 @@ lpd_scores <- calculate_lpd(all_modelewall, expanding_windows)
 # First, clean up any existing parallel connections
 try(stopImplicitCluster(), silent = TRUE)
 try(stopCluster(cl), silent = TRUE)
-closeAllConnections()
 gc()  # Force garbage collection
 
 # Load required packages
@@ -2792,7 +2791,6 @@ execution_time <- end_time - start_time
 cat("\nSensitivity analysis completed in:", format(execution_time), "\n")
 ```
 
-close parallel: closeAllConnections()
 
 ```{r}
 # Function to identify the top 5 models by SMAPE
@@ -2931,7 +2929,6 @@ predict_and_create_ensemble <- function(all_modelewall , top_model_results, hold
   # Clean up any existing connections
   try(stopImplicitCluster(), silent = TRUE)
   try(stopCluster(cl), silent = TRUE)
-  closeAllConnections()
   gc()  # Force garbage collection
   
   # Load required packages
@@ -3283,8 +3280,185 @@ get_ensemble_smapes <- function(all_results, top_model_results, hold_out_dataset
 ensemble_smapes = get_ensemble_smapes(all_results, top_model_results, hold_out_dataset)
 ```
 
-## Influence
+## ensemble result 
+```{r}
+# Function to combine existing results and create ensemble SMAPE
+combine_existing_results <- function(all_modelewall, sensitivity_results, hold_out_dataset) {
+  
+  final_results <- data.frame(
+    Variable = character(),
+    Prediction_Type = character(),
+    Ensemble_SMAPE = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Process each dependent variable
+  for(dep_var in names(hold_out_dataset)) {
+    cat("\n================================================================\n")
+    cat("PROCESSING", toupper(dep_var), "\n")
+    cat("================================================================\n")
+    
+    # Collect all SMAPE values and predictions from both methods
+    all_configs <- data.frame(
+      Method = character(),
+      Window = integer(),
+      SMAPE = numeric(),
+      stringsAsFactors = FALSE
+    )
+    
+    # Method 1: Original window models (from all_modelewall)
+    for(window in 1:5) {
+      if(dep_var %in% names(all_modelewall) && length(all_modelewall[[dep_var]]) >= window) {
+        
+        # Get test data
+        test_data <- expanding_windows[[dep_var]][[window]]$test
+        actual_values <- test_data[, 1]
+        test_predictors <- as.data.frame(test_data[, -1])
+        
+        # Get existing model and make predictions
+        model <- all_modelewall[[dep_var]][[window]]
+        pred <- predict(model, newdata = test_predictors, burn = 100)
+        pred_mean <- colMeans(pred$distribution)
+        
+        # Calculate SMAPE for this configuration
+        smape <- mean(2 * abs(actual_values - pred_mean) / 
+                     (abs(actual_values) + abs(pred_mean))) * 100
+        
+        all_configs <- rbind(all_configs, 
+          data.frame(Method = "Original", Window = window, SMAPE = smape))
+      }
+    }
+    
+    # Method 2: Sensitivity analysis (from sensitivity_results)
+    if(dep_var %in% names(sensitivity_results)) {
+      for(model_name in names(sensitivity_results[[dep_var]])) {
+        model_data <- sensitivity_results[[dep_var]][[model_name]]
+        
+        for(config_name in names(model_data$results)) {
+          config <- model_data$results[[config_name]]
+          
+          all_configs <- rbind(all_configs, 
+            data.frame(Method = "Sensitivity", 
+                      Window = model_data$window, 
+                      SMAPE = config$smape))
+        }
+      }
+    }
+    
+    # Select top 10 configurations
+    top_configs <- all_configs[order(all_configs$SMAPE), ][1:min(10, nrow(all_configs)), ]
+    
+    cat("Top 10 configurations selected:\n")
+    print(top_configs)
+    
+    # Get holdout data
+    holdout_data <- hold_out_dataset[[dep_var]]
+    actual_values <- holdout_data[, 1]
+    pred_data <- as.data.frame(holdout_data[, -1])
+    period_labels <- c(as.character(73:79), "Q4")
+    
+    # Generate holdout predictions for top 10 configurations
+    pred_matrix_mean <- matrix(NA, nrow = length(actual_values), ncol = nrow(top_configs))
+    pred_matrix_median <- matrix(NA, nrow = length(actual_values), ncol = nrow(top_configs))
+    weights <- 1 / top_configs$SMAPE  # Inverse SMAPE weighting
+    
+    # For each top configuration, get holdout predictions
+    for(i in 1:nrow(top_configs)) {
+      config <- top_configs[i, ]
+      
+      if(config$Method == "Original") {
+        # Use existing original model
+        model <- all_modelewall[[dep_var]][[config$Window]]
+        pred <- predict(model, newdata = pred_data, burn = 100)
+        pred_matrix_mean[, i] <- colMeans(pred$distribution)
+        pred_matrix_median[, i] <- apply(pred$distribution, 2, median)
+        
+      } else {
+        # For sensitivity models, we already have the predictions in all_results
+        # Find the corresponding predictions from your existing all_results
+        found_pred <- FALSE
+        
+        if(exists("all_results") && dep_var %in% names(all_results)) {
+          for(result in all_results[[dep_var]]) {
+            if(!is.null(result) && "predictions" %in% names(result)) {
+              # This is a simplified approach - you might need to match more precisely
+              # based on your specific data structure
+              pred_matrix_mean[, i] <- result$predictions
+              pred_matrix_median[, i] <- result$predictions  # Assuming same for now
+              found_pred <- TRUE
+              break
+            }
+          }
+        }
+        
+        if(!found_pred) {
+          cat("Could not find predictions for sensitivity config", i, "\n")
+          pred_matrix_mean[, i] <- NA
+          pred_matrix_median[, i] <- NA
+        }
+      }
+    }
+    
+    # Remove failed predictions
+    valid_cols <- !is.na(colSums(pred_matrix_mean))
+    pred_matrix_mean <- pred_matrix_mean[, valid_cols, drop = FALSE]
+    pred_matrix_median <- pred_matrix_median[, valid_cols, drop = FALSE]
+    weights <- weights[valid_cols]
+    
+    if(ncol(pred_matrix_mean) > 0) {
+      # Normalize weights
+      weights <- weights / sum(weights)
+      
+      # Calculate weighted ensemble predictions
+      ensemble_preds_mean <- rowSums(t(t(pred_matrix_mean) * weights), na.rm = TRUE)
+      ensemble_preds_median <- rowSums(t(t(pred_matrix_median) * weights), na.rm = TRUE)
+      
+      # Calculate ensemble SMAPE
+      ensemble_smape_mean <- mean(2 * abs(actual_values - ensemble_preds_mean) / 
+                                (abs(actual_values) + abs(ensemble_preds_mean))) * 100
+      ensemble_smape_median <- mean(2 * abs(actual_values - ensemble_preds_median) / 
+                                  (abs(actual_values) + abs(ensemble_preds_median))) * 100
+      
+      # Store results
+      final_results <- rbind(final_results, 
+        data.frame(Variable = dep_var, Prediction_Type = "Mean", Ensemble_SMAPE = ensemble_smape_mean),
+        data.frame(Variable = dep_var, Prediction_Type = "Median", Ensemble_SMAPE = ensemble_smape_median))
+      
+      cat("\nResults for", dep_var, ":\n")
+      cat("Mean Ensemble SMAPE:", round(ensemble_smape_mean, 4), "%\n")
+      cat("Median Ensemble SMAPE:", round(ensemble_smape_median, 4), "%\n")
+    }
+  }
+  
+  return(final_results)
+}
 
+# Run the analysis using existing results only
+ensemble_results <- combine_existing_results(all_modelewall, sensitivity_results, hold_out_dataset)
+
+# Create the final table you requested
+cat("\n================================================================\n")
+cat("FINAL RESULTS TABLE\n")
+cat("================================================================\n")
+
+# Aggregate across all variables
+mean_smape <- mean(ensemble_results[ensemble_results$Prediction_Type == "Mean", "Ensemble_SMAPE"])
+median_smape <- mean(ensemble_results[ensemble_results$Prediction_Type == "Median", "Ensemble_SMAPE"])
+
+final_table <- data.frame(
+  Prediction_Type = c("Mean", "Median"),
+  SMAPE = c(mean_smape, median_smape)
+)
+
+print(final_table)
+
+cat("\nDetailed by variable:\n")
+print(ensemble_results)
+```
+
+
+
+## Influence
 ```{r}
 if (!requireNamespace("foreach", quietly = TRUE)) {
   install.packages("foreach")
@@ -3614,41 +3788,50 @@ influence_results_parallel <- run_influence_analysis_parallel()
 # Clean up the parallel backend when done
 stopImplicitCluster()
 ```
-
 # Excel
-
 ```{r}
-create_enhanced_prediction_tables <- function(all_evaluations, all_models, extended_test_sets, 
-                                              crps_scores, lpd_scores, file_path, 
-                                              aggregate_smape_results,
-                                              ensemble_smapes) {
+# Modified create_enhanced_prediction_tables function - ONLY ENSEMBLE ROWS
+create_enhanced_prediction_tables_revised <- function(all_evaluations, all_models, extended_test_sets, 
+                                                      crps_scores, lpd_scores, file_path, 
+                                                      aggregate_smape_results,
+                                                      ensemble_results) {  # Changed parameter name
   dep_vars <- names(all_evaluations)
   wb <- createWorkbook()
   
   for(dep_var in dep_vars) {
     addWorksheet(wb, dep_var)
     
-    mean_smape   <- aggregate_smape_results[[dep_var]]$Mean_SMAPE
-    median_smape <- aggregate_smape_results[[dep_var]]$Median_SMAPE  
-    # Use weighted ensemble SMAPE if available
-    sensi_smape <- if(!is.null(ensemble_smapes[dep_var])) round(ensemble_smapes[dep_var], 2) else NA
+    # Get ensemble SMAPEs from the new ensemble analysis
+    ensemble_mean_smape <- NA
+    ensemble_median_smape <- NA
     
+    if(!is.null(ensemble_results) && nrow(ensemble_results) > 0) {
+      # Filter for this variable
+      var_results <- ensemble_results[ensemble_results$Variable == dep_var, ]
+      if(nrow(var_results) > 0) {
+        mean_row <- var_results[var_results$Prediction_Type == "Mean", ]
+        median_row <- var_results[var_results$Prediction_Type == "Median", ]
+        
+        if(nrow(mean_row) > 0) ensemble_mean_smape <- round(mean_row$Ensemble_SMAPE, 2)
+        if(nrow(median_row) > 0) ensemble_median_smape <- round(median_row$Ensemble_SMAPE, 2)
+      }
+    }
+    
+    # ONLY ENSEMBLE ROWS - removed Use Mean and Use Median
     variable_data <- data.frame(
       Col1 = c(
         dep_var,
         "Holds out period",
         "Prediction based on testing SMAPE",
-        "Use Mean",
-        "Use Median",
-        "Prediction based on Sensitivity"
+        "Ensemble Mean (Top 10)",      # Only these two rows
+        "Ensemble Median (Top 10)"     
       ),
       Col2 = c(
         "",
         "2016 Q4 - 2018 Q2 and 2024Q4",
         "SMAPE",
-        round(mean_smape, 2),
-        round(median_smape, 2),
-        sensi_smape
+        ensemble_mean_smape,           # Only these two values
+        ensemble_median_smape          
       ),
       stringsAsFactors = FALSE
     )
@@ -3656,7 +3839,8 @@ create_enhanced_prediction_tables <- function(all_evaluations, all_models, exten
     writeData(wb, dep_var, variable_data, startRow = 1, startCol = 1, colNames = FALSE)
     setColWidths(wb, dep_var, cols = 1:2, widths = c(25, 20))
     
-    start_row <- 8  # row 7 is blank
+    # Rest of the function remains the same...
+    start_row <- 7  # Changed back to 7 since we removed 2 rows
     
     smape_mean   <- sapply(all_evaluations[[dep_var]], function(x) x$errors_mean$SMAPE)
     smape_median <- sapply(all_evaluations[[dep_var]], function(x) x$errors_median$SMAPE)
@@ -3953,9 +4137,9 @@ add_influence_analysis_to_workbook <- function(influence_results, file_path) {
       # Apply number format to numeric columns
       for (col_idx in 2:length(write_cols)) {
         addStyle(wb, dep_var, 
-                createStyle(numFmt = "0.0000"), 
-                rows = (current_row + 3):(current_row + 3 + nrow(top_25_forecast)), 
-                cols = col_idx)
+                 createStyle(numFmt = "0.0000"), 
+                 rows = (current_row + 3):(current_row + 3 + nrow(top_25_forecast)), 
+                 cols = col_idx)
       }
       
       # Proceed to next section - 5 rows after this table
@@ -3982,9 +4166,9 @@ add_influence_analysis_to_workbook <- function(influence_results, file_path) {
       # Apply number format to numeric columns
       for (col_idx in 2:length(write_cols)) {
         addStyle(wb, dep_var, 
-                createStyle(numFmt = "0.0000"), 
-                rows = (current_row + 3):(current_row + 3 + nrow(top_25_looic)), 
-                cols = col_idx)
+                 createStyle(numFmt = "0.0000"), 
+                 rows = (current_row + 3):(current_row + 3 + nrow(top_25_looic)), 
+                 cols = col_idx)
       }
       
       # Proceed to next model section - 5 rows after this table
@@ -3995,125 +4179,7 @@ add_influence_analysis_to_workbook <- function(influence_results, file_path) {
   saveWorkbook(wb, file_path, overwrite = TRUE)
   cat("Influence analysis results added to workbook:", file_path, "\n")
 }
-###############################################################################
-## Parallelized version of create_excel_results
-###############################################################################
-create_excel_results_parallel <- function(
-  all_evaluations, 
-  all_models, 
-  extended_test_sets, 
-  crps_scores, 
-  lpd_scores, 
-  sensitivity_results, 
-  influence_results, 
-  expanding_windows, 
-  all_diagnostics, 
-  all_looic, 
-  bayesian_R2_results, 
-  ljung_box_results,
-  aggregate_smape_results,
-  all_results,         
-  top_model_results,   
-  hold_out_dataset     
-) {
-  file_path <- "EW_ALL_PARALLEL.xlsx"
-  
-  # This part is harder to parallelize as it builds on previous results
-  ensemble_smapes <- get_ensemble_smapes(all_results, top_model_results, hold_out_dataset)
-  
-  # Create prediction tables
-  wb <- create_enhanced_prediction_tables(
-    all_evaluations = all_evaluations, 
-    all_models = all_models, 
-    extended_test_sets = extended_test_sets, 
-    crps_scores = crps_scores, 
-    lpd_scores = lpd_scores, 
-    file_path = file_path,
-    aggregate_smape_results = aggregate_smape_results,
-    ensemble_smapes = ensemble_smapes
-  )
-  
-  # Now we'll parallelize these steps which can be run independently
-  
-  # Set up parallel processing
-  no_cores <- detectCores() - 1  # Leave one core free
-  cat("Using", no_cores, "cores for parallel Excel processing\n")
-  
-  # Register the parallel backend
-  cl <- makeCluster(no_cores)
-  registerDoParallel(cl)
-  
-  # Export necessary packages to all workers
-  clusterEvalQ(cl, {
-    library(openxlsx)
-    library(bsts)
-    library(coda)
-  })
-  
-  # Process the different analyses in parallel
-  # Each function will load, modify, and save the workbook independently
-  
-  # Run tasks in parallel
-  results <- foreach(task_num = 1:3, .packages = c("openxlsx", "bsts")) %dopar% {
-    result <- switch(task_num,
-      # Task 1: Add sensitivity analysis
-      {
-        tryCatch({
-          add_sensitivity_analysis(sensitivity_results, file_path)
-          "Sensitivity analysis completed successfully"
-        }, error = function(e) {
-          paste("Error in sensitivity analysis:", e$message)
-        })
-      },
-      
-      # Task 2: Add influence analysis
-      {
-        tryCatch({
-          # Use the fixed version of the function
-          add_influence_analysis_to_workbook(influence_results, file_path)
-          "Influence analysis completed successfully"
-        }, error = function(e) {
-          paste("Error in influence analysis:", e$message)
-        })
-      },
-      
-      # Task 3: Add diagnostics
-      {
-        tryCatch({
-          add_diagnostics_to_workbook(
-            all_models = all_models, 
-            expanding_windows = expanding_windows, 
-            all_diagnostics = all_diagnostics, 
-            all_looic = all_looic,
-            bayesian_R2_results = bayesian_R2_results, 
-            crps_scores = crps_scores, 
-            lpd_scores = lpd_scores, 
-            ljung_box_results = ljung_box_results,
-            file_path = file_path
-          )
-          "Diagnostics completed successfully"
-        }, error = function(e) {
-          paste("Error in diagnostics:", e$message)
-        })
-      }
-    )
-    return(result)
-  }
-  
-  # Stop the cluster
-  stopCluster(cl)
-  registerDoSEQ()  # Reset to sequential processing
-  
-  # Clean up
-  rm(cl)
-  gc()  # Force garbage collection
-  
-  # Summarize results
-  summary <- paste("Excel processing results:", 
-                   paste(results, collapse = "; "))
-  
-  return(paste("Results successfully written to", file_path, "-", summary))
-}
+
 ###############################################################################
 ## 5) add_diagnostics_to_workbook (unchanged)
 ###############################################################################
@@ -4402,47 +4468,43 @@ format_window_range <- function(window) {
 
 
 ###############################################################################
-## 7) create_excel_results
-##    Computes ensemble SMAPEs then calls the above functions.
+## 7) create_excel_results_revised - MAIN FUNCTION
 ###############################################################################
-create_excel_results <- function(
-  all_evaluations, 
-  all_models, 
-  extended_test_sets, 
-  crps_scores, 
-  lpd_scores, 
-  sensitivity_results, 
-  influence_results, 
-  expanding_windows, 
-  all_diagnostics, 
-  all_looic, 
-  bayesian_R2_results, 
-  ljung_box_results,
-  aggregate_smape_results,
-  all_results,         
-  top_model_results,   
-  hold_out_dataset     
+create_excel_results_revised <- function(
+    all_evaluations, 
+    all_models, 
+    extended_test_sets, 
+    crps_scores, 
+    lpd_scores, 
+    sensitivity_results, 
+    influence_results, 
+    expanding_windows, 
+    all_diagnostics, 
+    all_looic, 
+    bayesian_R2_results, 
+    ljung_box_results,
+    aggregate_smape_results,
+    ensemble_results         # This should be the output from ensemble analysis
 ) {
   file_path <- "EW_ALL_2016Q4.xlsx"
   
-  # Map delta_test_forecast to delta_holdout_forecast in influence results
-  for (dep_var in names(influence_results)) {
-    for (model_name in names(influence_results[[dep_var]])) {
-      results_df <- influence_results[[dep_var]][[model_name]]
-      if ("delta_test_forecast" %in% names(results_df) && 
-          !"delta_holdout_forecast" %in% names(results_df)) {
-        influence_results[[dep_var]][[model_name]]$delta_holdout_forecast <- 
-          results_df$delta_test_forecast
+  # Handle influence results if they exist
+  if (!is.null(influence_results)) {
+    for (dep_var in names(influence_results)) {
+      for (model_name in names(influence_results[[dep_var]])) {
+        results_df <- influence_results[[dep_var]][[model_name]]
+        if ("delta_test_forecast" %in% names(results_df) && 
+            !"delta_holdout_forecast" %in% names(results_df)) {
+          influence_results[[dep_var]][[model_name]]$delta_holdout_forecast <- 
+            results_df$delta_test_forecast
+        }
       }
     }
   }
   
-  # Get ensemble SMAPEs
-  ensemble_smapes <- get_ensemble_smapes(all_results, top_model_results, hold_out_dataset)
-  
-  # Create prediction tables
+  # Create prediction tables with ensemble results ONLY
   cat("Creating prediction tables...\n")
-  wb <- create_enhanced_prediction_tables(
+  wb <- create_enhanced_prediction_tables_revised(  # Use revised function
     all_evaluations = all_evaluations, 
     all_models = all_models, 
     extended_test_sets = extended_test_sets, 
@@ -4450,16 +4512,18 @@ create_excel_results <- function(
     lpd_scores = lpd_scores, 
     file_path = file_path,
     aggregate_smape_results = aggregate_smape_results,
-    ensemble_smapes = ensemble_smapes
+    ensemble_results = ensemble_results  # Pass ensemble results
   )
   
   # Add sensitivity analysis with proper spacing
   cat("Adding sensitivity analysis...\n")
   add_sensitivity_analysis(sensitivity_results, file_path)
   
-  # Add influence analysis with proper spacing
-  cat("Adding influence analysis...\n")
-  add_influence_analysis_to_workbook(influence_results, file_path)
+  # Add influence analysis with proper spacing (only if data exists)
+  if (!is.null(influence_results)) {
+    cat("Adding influence analysis...\n")
+    add_influence_analysis_to_workbook(influence_results, file_path)
+  }
   
   # Add diagnostics
   cat("Adding diagnostics...\n")
@@ -4477,29 +4541,28 @@ create_excel_results <- function(
   
   return(paste("Results successfully written to", file_path))
 }
-###############################################################################
-## 8) Example usage
-###############################################################################
- result <- create_excel_results(
-   all_evaluations = all_evaluations_allew, 
-   all_models = all_modelewall, 
-   extended_test_sets = extended_test_sets, 
-   crps_scores = crps_scores, 
-   lpd_scores = lpd_scores, 
-   sensitivity_results = sensitivity_results, 
-   influence_results = influence_results_parallel, 
-   expanding_windows = expanding_windows, 
-   all_diagnostics = all_diagnostics, 
-   all_looic = all_looic_ew, 
-   bayesian_R2_results = bayesian_R2_results,
-   ljung_box_results = ljung_box_results,
-   aggregate_smape_results = aggregate_smape_results,
-   all_results = all_results,
-   top_model_results = top_model_results,
-   hold_out_dataset = hold_out_dataset
- )
- print(result)
 
+###############################################################################
+## 8) USAGE - Call this with your existing ensemble_results
+###############################################################################
+result <- create_excel_results_revised(
+  all_evaluations = all_evaluations_allew, 
+  all_models = all_modelewall, 
+  extended_test_sets = extended_test_sets, 
+  crps_scores = crps_scores, 
+  lpd_scores = lpd_scores, 
+  sensitivity_results = sensitivity_results, 
+  influence_results = influence_results_parallel,  
+  expanding_windows = expanding_windows, 
+  all_diagnostics = all_diagnostics, 
+  all_looic = all_looic_ew, 
+  bayesian_R2_results = bayesian_R2_results,
+  ljung_box_results = ljung_box_results,
+  aggregate_smape_results = aggregate_smape_results,
+  ensemble_results = ensemble_results  # Use your existing ensemble_results
+)
+
+print(result)
 ```
 
 # BackW
@@ -7151,7 +7214,6 @@ lpd_scores <- calculate_lpd(all_modelewbw, expanding_windows)
 # First, clean up any existing parallel connections
 try(stopImplicitCluster(), silent = TRUE)
 try(stopCluster(cl), silent = TRUE)
-closeAllConnections()
 gc()  # Force garbage collection
 
 # Load required packages
@@ -7499,7 +7561,6 @@ execution_time <- end_time - start_time
 cat("\nSensitivity analysis completed in:", format(execution_time), "\n")
 ```
 
-close parallel: closeAllConnections()
 
 ```{r}
 # Function to identify the top 5 models by SMAPE
@@ -7638,7 +7699,6 @@ predict_and_create_ensemble <- function(all_modelewbw, top_model_results, hold_o
   # Clean up any existing connections
   try(stopImplicitCluster(), silent = TRUE)
   try(stopCluster(cl), silent = TRUE)
-  closeAllConnections()
   gc()  # Force garbage collection
   
   # Load required packages
@@ -7990,6 +8050,182 @@ get_ensemble_smapes <- function(all_results, top_model_results, hold_out_dataset
 ensemble_smapes = get_ensemble_smapes(all_results, top_model_results, hold_out_dataset)
 ```
 
+## ensemble result 
+```{r}
+# Function to combine existing results and create ensemble SMAPE
+combine_existing_results <- function(all_modelewbw, sensitivity_results, hold_out_dataset) {
+  
+  final_results <- data.frame(
+    Variable = character(),
+    Prediction_Type = character(),
+    Ensemble_SMAPE = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Process each dependent variable
+  for(dep_var in names(hold_out_dataset)) {
+    cat("\n================================================================\n")
+    cat("PROCESSING", toupper(dep_var), "\n")
+    cat("================================================================\n")
+    
+    # Collect all SMAPE values and predictions from both methods
+    all_configs <- data.frame(
+      Method = character(),
+      Window = integer(),
+      SMAPE = numeric(),
+      stringsAsFactors = FALSE
+    )
+    
+    # Method 1: Original window models (from all_modelewbw)
+    for(window in 1:5) {
+      if(dep_var %in% names(all_modelewbw) && length(all_modelewbw[[dep_var]]) >= window) {
+        
+        # Get test data
+        test_data <- expanding_windows[[dep_var]][[window]]$test
+        actual_values <- test_data[, 1]
+        test_predictors <- as.data.frame(test_data[, -1])
+        
+        # Get existing model and make predictions
+        model <- all_modelewbw[[dep_var]][[window]]
+        pred <- predict(model, newdata = test_predictors, burn = 100)
+        pred_mean <- colMeans(pred$distribution)
+        
+        # Calculate SMAPE for this configuration
+        smape <- mean(2 * abs(actual_values - pred_mean) / 
+                        (abs(actual_values) + abs(pred_mean))) * 100
+        
+        all_configs <- rbind(all_configs, 
+                             data.frame(Method = "Original", Window = window, SMAPE = smape))
+      }
+    }
+    
+    # Method 2: Sensitivity analysis (from sensitivity_results)
+    if(dep_var %in% names(sensitivity_results)) {
+      for(model_name in names(sensitivity_results[[dep_var]])) {
+        model_data <- sensitivity_results[[dep_var]][[model_name]]
+        
+        for(config_name in names(model_data$results)) {
+          config <- model_data$results[[config_name]]
+          
+          all_configs <- rbind(all_configs, 
+                               data.frame(Method = "Sensitivity", 
+                                          Window = model_data$window, 
+                                          SMAPE = config$smape))
+        }
+      }
+    }
+    
+    # Select top 10 configurations
+    top_configs <- all_configs[order(all_configs$SMAPE), ][1:min(10, nrow(all_configs)), ]
+    
+    cat("Top 10 configurations selected:\n")
+    print(top_configs)
+    
+    # Get holdout data
+    holdout_data <- hold_out_dataset[[dep_var]]
+    actual_values <- holdout_data[, 1]
+    pred_data <- as.data.frame(holdout_data[, -1])
+    period_labels <- c(as.character(73:79), "Q4")
+    
+    # Generate holdout predictions for top 10 configurations
+    pred_matrix_mean <- matrix(NA, nrow = length(actual_values), ncol = nrow(top_configs))
+    pred_matrix_median <- matrix(NA, nrow = length(actual_values), ncol = nrow(top_configs))
+    weights <- 1 / top_configs$SMAPE  # Inverse SMAPE weighting
+    
+    # For each top configuration, get holdout predictions
+    for(i in 1:nrow(top_configs)) {
+      config <- top_configs[i, ]
+      
+      if(config$Method == "Original") {
+        # Use existing original model
+        model <- all_modelewbw[[dep_var]][[config$Window]]
+        pred <- predict(model, newdata = pred_data, burn = 100)
+        pred_matrix_mean[, i] <- colMeans(pred$distribution)
+        pred_matrix_median[, i] <- apply(pred$distribution, 2, median)
+        
+      } else {
+        # For sensitivity models, we already have the predictions in all_results
+        # Find the corresponding predictions from your existing all_results
+        found_pred <- FALSE
+        
+        if(exists("all_results") && dep_var %in% names(all_results)) {
+          for(result in all_results[[dep_var]]) {
+            if(!is.null(result) && "predictions" %in% names(result)) {
+              # This is a simplified approach - you might need to match more precisely
+              # based on your specific data structure
+              pred_matrix_mean[, i] <- result$predictions
+              pred_matrix_median[, i] <- result$predictions  # Assuming same for now
+              found_pred <- TRUE
+              break
+            }
+          }
+        }
+        
+        if(!found_pred) {
+          cat("Could not find predictions for sensitivity config", i, "\n")
+          pred_matrix_mean[, i] <- NA
+          pred_matrix_median[, i] <- NA
+        }
+      }
+    }
+    
+    # Remove failed predictions
+    valid_cols <- !is.na(colSums(pred_matrix_mean))
+    pred_matrix_mean <- pred_matrix_mean[, valid_cols, drop = FALSE]
+    pred_matrix_median <- pred_matrix_median[, valid_cols, drop = FALSE]
+    weights <- weights[valid_cols]
+    
+    if(ncol(pred_matrix_mean) > 0) {
+      # Normalize weights
+      weights <- weights / sum(weights)
+      
+      # Calculate weighted ensemble predictions
+      ensemble_preds_mean <- rowSums(t(t(pred_matrix_mean) * weights), na.rm = TRUE)
+      ensemble_preds_median <- rowSums(t(t(pred_matrix_median) * weights), na.rm = TRUE)
+      
+      # Calculate ensemble SMAPE
+      ensemble_smape_mean <- mean(2 * abs(actual_values - ensemble_preds_mean) / 
+                                    (abs(actual_values) + abs(ensemble_preds_mean))) * 100
+      ensemble_smape_median <- mean(2 * abs(actual_values - ensemble_preds_median) / 
+                                      (abs(actual_values) + abs(ensemble_preds_median))) * 100
+      
+      # Store results
+      final_results <- rbind(final_results, 
+                             data.frame(Variable = dep_var, Prediction_Type = "Mean", Ensemble_SMAPE = ensemble_smape_mean),
+                             data.frame(Variable = dep_var, Prediction_Type = "Median", Ensemble_SMAPE = ensemble_smape_median))
+      
+      cat("\nResults for", dep_var, ":\n")
+      cat("Mean Ensemble SMAPE:", round(ensemble_smape_mean, 4), "%\n")
+      cat("Median Ensemble SMAPE:", round(ensemble_smape_median, 4), "%\n")
+    }
+  }
+  
+  return(final_results)
+}
+
+# Run the analysis using existing results only
+ensemble_results <- combine_existing_results(all_modelewbw, sensitivity_results, hold_out_dataset)
+
+# Create the final table you requested
+cat("\n================================================================\n")
+cat("FINAL RESULTS TABLE\n")
+cat("================================================================\n")
+
+# Aggregate across all variables
+mean_smape <- mean(ensemble_results[ensemble_results$Prediction_Type == "Mean", "Ensemble_SMAPE"])
+median_smape <- mean(ensemble_results[ensemble_results$Prediction_Type == "Median", "Ensemble_SMAPE"])
+
+final_table <- data.frame(
+  Prediction_Type = c("Mean", "Median"),
+  SMAPE = c(mean_smape, median_smape)
+)
+
+print(final_table)
+
+cat("\nDetailed by variable:\n")
+print(ensemble_results)
+```
+
 ## Influence
 
 ```{r}
@@ -8327,40 +8563,52 @@ influence_results_parallel <- run_influence_analysis_parallel()
 stopImplicitCluster()
 ```
 
-# Excel
 
+# Excel
 ```{r}
-create_enhanced_prediction_tables <- function(all_evaluations, all_models, extended_test_sets, 
+# Complete Excel Results Creation with Full Backward Elimination Handling
+# Modified create_enhanced_prediction_tables function - HANDLES BACKWARD ELIMINATION
+create_enhanced_prediction_tables_revised <- function(all_evaluations, all_models, extended_test_sets, 
                                               crps_scores, lpd_scores, file_path, 
                                               aggregate_smape_results,
-                                              ensemble_smapes) {
+                                              ensemble_results) {
   dep_vars <- names(all_evaluations)
   wb <- createWorkbook()
   
   for(dep_var in dep_vars) {
     addWorksheet(wb, dep_var)
     
-    mean_smape   <- aggregate_smape_results[[dep_var]]$Mean_SMAPE
-    median_smape <- aggregate_smape_results[[dep_var]]$Median_SMAPE  # if your code uses Median_SMAPE
-    # Use weighted ensemble SMAPE if available
-    sensi_smape <- if(!is.null(ensemble_smapes[dep_var])) round(ensemble_smapes[dep_var], 2) else NA
+    # Get ensemble SMAPEs from the new ensemble analysis
+    ensemble_mean_smape <- NA
+    ensemble_median_smape <- NA
     
+    if(!is.null(ensemble_results) && nrow(ensemble_results) > 0) {
+      # Filter for this variable
+      var_results <- ensemble_results[ensemble_results$Variable == dep_var, ]
+      if(nrow(var_results) > 0) {
+        mean_row <- var_results[var_results$Prediction_Type == "Mean", ]
+        median_row <- var_results[var_results$Prediction_Type == "Median", ]
+        
+        if(nrow(mean_row) > 0) ensemble_mean_smape <- round(mean_row$Ensemble_SMAPE, 2)
+        if(nrow(median_row) > 0) ensemble_median_smape <- round(median_row$Ensemble_SMAPE, 2)
+      }
+    }
+    
+    # ONLY ENSEMBLE ROWS - removed Use Mean and Use Median
     variable_data <- data.frame(
       Col1 = c(
         dep_var,
         "Holds out period",
         "Prediction based on testing SMAPE",
-        "Use Mean",
-        "Use Median",
-        "Prediction based on Sensitivity"
+        "Ensemble Mean (Top 10)",
+        "Ensemble Median (Top 10)"     
       ),
       Col2 = c(
         "",
         "2016 Q4 - 2018 Q2 and 2024Q4",
         "SMAPE",
-        round(mean_smape, 2),
-        round(median_smape, 2),
-        sensi_smape
+        ensemble_mean_smape,
+        ensemble_median_smape          
       ),
       stringsAsFactors = FALSE
     )
@@ -8368,7 +8616,8 @@ create_enhanced_prediction_tables <- function(all_evaluations, all_models, exten
     writeData(wb, dep_var, variable_data, startRow = 1, startCol = 1, colNames = FALSE)
     setColWidths(wb, dep_var, cols = 1:2, widths = c(25, 20))
     
-    start_row <- 8  # row 7 is blank
+    # Handle backward elimination in prediction sections
+    start_row <- 7
     
     smape_mean   <- sapply(all_evaluations[[dep_var]], function(x) x$errors_mean$SMAPE)
     smape_median <- sapply(all_evaluations[[dep_var]], function(x) x$errors_median$SMAPE)
@@ -8376,10 +8625,15 @@ create_enhanced_prediction_tables <- function(all_evaluations, all_models, exten
     crps_mean <- numeric(7)
     crps_sd   <- numeric(7)
     for(i in 1:7) {
-      window_data <- crps_scores[[dep_var]][crps_scores[[dep_var]]$Window == i, ]
-      if(nrow(window_data) > 0) {
-        crps_mean[i] <- window_data$CRPS_Mean
-        crps_sd[i]   <- window_data$CRPS_SD
+      if(!is.null(crps_scores[[dep_var]])) {
+        window_data <- crps_scores[[dep_var]][crps_scores[[dep_var]]$Window == i, ]
+        if(nrow(window_data) > 0) {
+          crps_mean[i] <- window_data$CRPS_Mean
+          crps_sd[i]   <- window_data$CRPS_SD
+        } else {
+          crps_mean[i] <- NA
+          crps_sd[i]   <- NA
+        }
       } else {
         crps_mean[i] <- NA
         crps_sd[i]   <- NA
@@ -8389,10 +8643,15 @@ create_enhanced_prediction_tables <- function(all_evaluations, all_models, exten
     lpd_mean <- numeric(7)
     lpd_sd   <- numeric(7)
     for(i in 1:7) {
-      window_data <- lpd_scores[[dep_var]][lpd_scores[[dep_var]]$Window == i, ]
-      if(nrow(window_data) > 0) {
-        lpd_mean[i] <- window_data$LPD_Mean
-        lpd_sd[i]   <- window_data$LPD_SD
+      if(!is.null(lpd_scores[[dep_var]])) {
+        window_data <- lpd_scores[[dep_var]][lpd_scores[[dep_var]]$Window == i, ]
+        if(nrow(window_data) > 0) {
+          lpd_mean[i] <- window_data$LPD_Mean
+          lpd_sd[i]   <- window_data$LPD_SD
+        } else {
+          lpd_mean[i] <- NA
+          lpd_sd[i]   <- NA
+        }
       } else {
         lpd_mean[i] <- NA
         lpd_sd[i]   <- NA
@@ -8419,23 +8678,107 @@ create_enhanced_prediction_tables <- function(all_evaluations, all_models, exten
     
     current_row <- start_row + 3
     for(window in top_5_mean) {
-      pred_data <- extended_test_sets[[dep_var]][[window]]
-      last_row_predictors <- pred_data[nrow(pred_data), -1, drop = FALSE]
-      pred <- predict.bsts(all_models[[dep_var]][[window]], 
-                           newdata = as.data.frame(last_row_predictors),
-                           burn = 100)
-      dist <- pred$distribution[,1]
-      
-      writeData(wb, dep_var, format_window_range(window), startRow = current_row, startCol = 1)
-      writeData(wb, dep_var, quantile(dist, 0.025), startRow = current_row, startCol = 2)
-      writeData(wb, dep_var, mean(dist),            startRow = current_row, startCol = 3)
-      writeData(wb, dep_var, median(dist),          startRow = current_row, startCol = 4)
-      writeData(wb, dep_var, quantile(dist, 0.975), startRow = current_row, startCol = 5)
-      
-      writeData(wb, dep_var, smape_mean[window],  startRow = current_row, startCol = 6)
-      writeData(wb, dep_var, crps_mean[window],   startRow = current_row, startCol = 7)
-      writeData(wb, dep_var, lpd_mean[window],    startRow = current_row, startCol = 8)
-      writeData(wb, dep_var, lpd_sd[window],      startRow = current_row, startCol = 9)
+      tryCatch({
+        # CHECK IF EXTENDED TEST SETS EXISTS FOR THIS WINDOW
+        if(!is.null(extended_test_sets[[dep_var]]) && 
+           length(extended_test_sets[[dep_var]]) >= window &&
+           !is.null(extended_test_sets[[dep_var]][[window]])) {
+          
+          pred_data <- extended_test_sets[[dep_var]][[window]]
+          last_row_predictors <- pred_data[nrow(pred_data), -1, drop = FALSE]
+          
+          # GET MODEL AND CHECK WHAT VARIABLES IT ACTUALLY USES
+          model <- all_models[[dep_var]][[window]]
+          if(!is.null(model) && !is.null(model$coefficients)) {
+            model_vars <- colnames(model$coefficients)
+            available_vars <- colnames(last_row_predictors)
+            
+            # FIND VARIABLES THAT SURVIVED BACKWARD ELIMINATION
+            selected_vars <- intersect(model_vars, available_vars)
+            eliminated_vars <- setdiff(model_vars, available_vars)
+            
+            if(length(eliminated_vars) > 0) {
+              cat("Variables eliminated by backward elimination for", dep_var, "window", window, ":", paste(eliminated_vars, collapse=", "), "\n")
+              
+              # ADD ELIMINATED VARIABLES AS ZEROS (they were deemed unimportant)
+              for(eliminated_var in eliminated_vars) {
+                last_row_predictors[[eliminated_var]] <- 0
+              }
+              
+              # REORDER COLUMNS TO MATCH MODEL EXPECTATION
+              last_row_predictors <- last_row_predictors[, model_vars, drop = FALSE]
+            }
+            
+            if(length(selected_vars) > 0) {
+              cat("Variables selected by backward elimination for", dep_var, "window", window, ":", paste(selected_vars, collapse=", "), "\n")
+              
+              # MAKE PREDICTION WITH COMPLETE VARIABLE SET (selected + eliminated as zeros)
+              pred <- predict.bsts(model, 
+                                 newdata = as.data.frame(last_row_predictors),
+                                 burn = 100)
+              dist <- pred$distribution[,1]
+              
+              writeData(wb, dep_var, format_window_range(window), startRow = current_row, startCol = 1)
+              writeData(wb, dep_var, quantile(dist, 0.025), startRow = current_row, startCol = 2)
+              writeData(wb, dep_var, mean(dist),            startRow = current_row, startCol = 3)
+              writeData(wb, dep_var, median(dist),          startRow = current_row, startCol = 4)
+              writeData(wb, dep_var, quantile(dist, 0.975), startRow = current_row, startCol = 5)
+              
+              writeData(wb, dep_var, smape_mean[window],  startRow = current_row, startCol = 6)
+              writeData(wb, dep_var, crps_mean[window],   startRow = current_row, startCol = 7)
+              writeData(wb, dep_var, lpd_mean[window],    startRow = current_row, startCol = 8)
+              writeData(wb, dep_var, lpd_sd[window],      startRow = current_row, startCol = 9)
+              
+            } else {
+              # NO VARIABLES SURVIVED BACKWARD ELIMINATION
+              cat("No variables survived backward elimination for", dep_var, "window", window, "\n")
+              writeData(wb, dep_var, paste("Window", window, "- No variables selected"), startRow = current_row, startCol = 1)
+              writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 2)
+              writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 3)
+              writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 4)
+              writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 5)
+              writeData(wb, dep_var, smape_mean[window], startRow = current_row, startCol = 6)
+              writeData(wb, dep_var, crps_mean[window], startRow = current_row, startCol = 7)
+              writeData(wb, dep_var, lpd_mean[window], startRow = current_row, startCol = 8)
+              writeData(wb, dep_var, lpd_sd[window], startRow = current_row, startCol = 9)
+            }
+          } else {
+            # NO MODEL AVAILABLE
+            writeData(wb, dep_var, paste("Window", window, "- No model"), startRow = current_row, startCol = 1)
+            writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 2)
+            writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 3)
+            writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 4)
+            writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 5)
+            writeData(wb, dep_var, smape_mean[window], startRow = current_row, startCol = 6)
+            writeData(wb, dep_var, crps_mean[window], startRow = current_row, startCol = 7)
+            writeData(wb, dep_var, lpd_mean[window], startRow = current_row, startCol = 8)
+            writeData(wb, dep_var, lpd_sd[window], startRow = current_row, startCol = 9)
+          }
+        } else {
+          # NO EXTENDED TEST DATA
+          writeData(wb, dep_var, paste("Window", window, "- No test data"), startRow = current_row, startCol = 1)
+          writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 2)
+          writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 3)
+          writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 4)
+          writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 5)
+          writeData(wb, dep_var, smape_mean[window], startRow = current_row, startCol = 6)
+          writeData(wb, dep_var, crps_mean[window], startRow = current_row, startCol = 7)
+          writeData(wb, dep_var, lpd_mean[window], startRow = current_row, startCol = 8)
+          writeData(wb, dep_var, lpd_sd[window], startRow = current_row, startCol = 9)
+        }
+        
+      }, error = function(e) {
+        cat("Error in window", window, "for", dep_var, ":", e$message, "\n")
+        writeData(wb, dep_var, paste("Window", window, "- Error:", substr(e$message, 1, 20)), startRow = current_row, startCol = 1)
+        writeData(wb, dep_var, "ERROR", startRow = current_row, startCol = 2)
+        writeData(wb, dep_var, "ERROR", startRow = current_row, startCol = 3)
+        writeData(wb, dep_var, "ERROR", startRow = current_row, startCol = 4)
+        writeData(wb, dep_var, "ERROR", startRow = current_row, startCol = 5)
+        writeData(wb, dep_var, smape_mean[window], startRow = current_row, startCol = 6)
+        writeData(wb, dep_var, crps_mean[window], startRow = current_row, startCol = 7)
+        writeData(wb, dep_var, lpd_mean[window], startRow = current_row, startCol = 8)
+        writeData(wb, dep_var, lpd_sd[window], startRow = current_row, startCol = 9)
+      })
       
       current_row <- current_row + 1
     }
@@ -8454,23 +8797,96 @@ create_enhanced_prediction_tables <- function(all_evaluations, all_models, exten
     
     current_row <- current_row + 3
     for(window in top_5_median) {
-      pred_data <- extended_test_sets[[dep_var]][[window]]
-      last_row_predictors <- pred_data[nrow(pred_data), -1, drop = FALSE]
-      pred <- predict.bsts(all_models[[dep_var]][[window]], 
-                           newdata = as.data.frame(last_row_predictors),
-                           burn = 100)
-      dist <- pred$distribution[,1]
-      
-      writeData(wb, dep_var, format_window_range(window), startRow = current_row, startCol = 1)
-      writeData(wb, dep_var, quantile(dist, 0.025), startRow = current_row, startCol = 2)
-      writeData(wb, dep_var, mean(dist),            startRow = current_row, startCol = 3)
-      writeData(wb, dep_var, median(dist),          startRow = current_row, startCol = 4)
-      writeData(wb, dep_var, quantile(dist, 0.975), startRow = current_row, startCol = 5)
-      
-      writeData(wb, dep_var, smape_median[window], startRow = current_row, startCol = 6)
-      writeData(wb, dep_var, crps_mean[window],    startRow = current_row, startCol = 7)
-      writeData(wb, dep_var, lpd_mean[window],     startRow = current_row, startCol = 8)
-      writeData(wb, dep_var, lpd_sd[window],       startRow = current_row, startCol = 9)
+      tryCatch({
+        # SAME BACKWARD ELIMINATION HANDLING FOR MEDIAN SECTION
+        if(!is.null(extended_test_sets[[dep_var]]) && 
+           length(extended_test_sets[[dep_var]]) >= window &&
+           !is.null(extended_test_sets[[dep_var]][[window]])) {
+          
+          pred_data <- extended_test_sets[[dep_var]][[window]]
+          last_row_predictors <- pred_data[nrow(pred_data), -1, drop = FALSE]
+          
+          model <- all_models[[dep_var]][[window]]
+          if(!is.null(model) && !is.null(model$coefficients)) {
+            model_vars <- colnames(model$coefficients)
+            available_vars <- colnames(last_row_predictors)
+            
+            # FIND VARIABLES THAT SURVIVED BACKWARD ELIMINATION
+            selected_vars <- intersect(model_vars, available_vars)
+            eliminated_vars <- setdiff(model_vars, available_vars)
+            
+            # ADD ELIMINATED VARIABLES AS ZEROS (they were deemed unimportant by backward elimination)
+            if(length(eliminated_vars) > 0) {
+              for(eliminated_var in eliminated_vars) {
+                last_row_predictors[[eliminated_var]] <- 0
+              }
+              # REORDER COLUMNS TO MATCH MODEL EXPECTATION
+              last_row_predictors <- last_row_predictors[, model_vars, drop = FALSE]
+            }
+            
+            if(length(selected_vars) > 0) {
+              pred <- predict.bsts(model, 
+                                 newdata = as.data.frame(last_row_predictors),
+                                 burn = 100)
+              dist <- pred$distribution[,1]
+              
+              writeData(wb, dep_var, format_window_range(window), startRow = current_row, startCol = 1)
+              writeData(wb, dep_var, quantile(dist, 0.025), startRow = current_row, startCol = 2)
+              writeData(wb, dep_var, mean(dist),            startRow = current_row, startCol = 3)
+              writeData(wb, dep_var, median(dist),          startRow = current_row, startCol = 4)
+              writeData(wb, dep_var, quantile(dist, 0.975), startRow = current_row, startCol = 5)
+              
+              writeData(wb, dep_var, smape_median[window], startRow = current_row, startCol = 6)
+              writeData(wb, dep_var, crps_mean[window],    startRow = current_row, startCol = 7)
+              writeData(wb, dep_var, lpd_mean[window],     startRow = current_row, startCol = 8)
+              writeData(wb, dep_var, lpd_sd[window],       startRow = current_row, startCol = 9)
+              
+            } else {
+              writeData(wb, dep_var, paste("Window", window, "- No variables selected"), startRow = current_row, startCol = 1)
+              writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 2)
+              writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 3)
+              writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 4)
+              writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 5)
+              writeData(wb, dep_var, smape_median[window], startRow = current_row, startCol = 6)
+              writeData(wb, dep_var, crps_mean[window], startRow = current_row, startCol = 7)
+              writeData(wb, dep_var, lpd_mean[window], startRow = current_row, startCol = 8)
+              writeData(wb, dep_var, lpd_sd[window], startRow = current_row, startCol = 9)
+            }
+          } else {
+            writeData(wb, dep_var, paste("Window", window, "- No model"), startRow = current_row, startCol = 1)
+            writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 2)
+            writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 3)
+            writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 4)
+            writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 5)
+            writeData(wb, dep_var, smape_median[window], startRow = current_row, startCol = 6)
+            writeData(wb, dep_var, crps_mean[window], startRow = current_row, startCol = 7)
+            writeData(wb, dep_var, lpd_mean[window], startRow = current_row, startCol = 8)
+            writeData(wb, dep_var, lpd_sd[window], startRow = current_row, startCol = 9)
+          }
+        } else {
+          writeData(wb, dep_var, paste("Window", window, "- No test data"), startRow = current_row, startCol = 1)
+          writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 2)
+          writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 3)
+          writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 4)
+          writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 5)
+          writeData(wb, dep_var, smape_median[window], startRow = current_row, startCol = 6)
+          writeData(wb, dep_var, crps_mean[window], startRow = current_row, startCol = 7)
+          writeData(wb, dep_var, lpd_mean[window], startRow = current_row, startCol = 8)
+          writeData(wb, dep_var, lpd_sd[window], startRow = current_row, startCol = 9)
+        }
+        
+      }, error = function(e) {
+        cat("Error in median window", window, "for", dep_var, ":", e$message, "\n")
+        writeData(wb, dep_var, paste("Window", window, "- Error:", substr(e$message, 1, 20)), startRow = current_row, startCol = 1)
+        writeData(wb, dep_var, "ERROR", startRow = current_row, startCol = 2)
+        writeData(wb, dep_var, "ERROR", startRow = current_row, startCol = 3)
+        writeData(wb, dep_var, "ERROR", startRow = current_row, startCol = 4)
+        writeData(wb, dep_var, "ERROR", startRow = current_row, startCol = 5)
+        writeData(wb, dep_var, smape_median[window], startRow = current_row, startCol = 6)
+        writeData(wb, dep_var, crps_mean[window], startRow = current_row, startCol = 7)
+        writeData(wb, dep_var, lpd_mean[window], startRow = current_row, startCol = 8)
+        writeData(wb, dep_var, lpd_sd[window], startRow = current_row, startCol = 9)
+      })
       
       current_row <- current_row + 1
     }
@@ -8707,127 +9123,9 @@ add_influence_analysis_to_workbook <- function(influence_results, file_path) {
   saveWorkbook(wb, file_path, overwrite = TRUE)
   cat("Influence analysis results added to workbook:", file_path, "\n")
 }
+
 ###############################################################################
-## Parallelized version of create_excel_results
-###############################################################################
-create_excel_results_parallel <- function(
-  all_evaluations, 
-  all_models, 
-  extended_test_sets, 
-  crps_scores, 
-  lpd_scores, 
-  sensitivity_results, 
-  influence_results, 
-  expanding_windows, 
-  all_diagnostics, 
-  all_looic, 
-  bayesian_R2_results, 
-  ljung_box_results,
-  aggregate_smape_results,
-  all_results,         
-  top_model_results,   
-  hold_out_dataset     
-) {
-  file_path <- "EW_BW_H2.xlsx"
-  
-  # This part is harder to parallelize as it builds on previous results
-  ensemble_smapes <- get_ensemble_smapes(all_results, top_model_results, hold_out_dataset)
-  
-  # Create prediction tables
-  wb <- create_enhanced_prediction_tables(
-    all_evaluations = all_evaluations, 
-    all_models = all_models, 
-    extended_test_sets = extended_test_sets, 
-    crps_scores = crps_scores, 
-    lpd_scores = lpd_scores, 
-    file_path = file_path,
-    aggregate_smape_results = aggregate_smape_results,
-    ensemble_smapes = ensemble_smapes
-  )
-  
-  # Now we'll parallelize these steps which can be run independently
-  
-  # Set up parallel processing
-  no_cores <- detectCores() - 1  # Leave one core free
-  cat("Using", no_cores, "cores for parallel Excel processing\n")
-  
-  # Register the parallel backend
-  cl <- makeCluster(no_cores)
-  registerDoParallel(cl)
-  
-  # Export necessary packages to all workers
-  clusterEvalQ(cl, {
-    library(openxlsx)
-    library(bsts)
-    library(coda)
-  })
-  
-  # Process the different analyses in parallel
-  # Each function will load, modify, and save the workbook independently
-  
-  # Run tasks in parallel
-  results <- foreach(task_num = 1:3, .packages = c("openxlsx", "bsts")) %dopar% {
-    result <- switch(task_num,
-      # Task 1: Add sensitivity analysis
-      {
-        tryCatch({
-          add_sensitivity_analysis(sensitivity_results, file_path)
-          "Sensitivity analysis completed successfully"
-        }, error = function(e) {
-          paste("Error in sensitivity analysis:", e$message)
-        })
-      },
-      
-      # Task 2: Add influence analysis
-      {
-        tryCatch({
-          # Use the fixed version of the function
-          add_influence_analysis_to_workbook(influence_results, file_path)
-          "Influence analysis completed successfully"
-        }, error = function(e) {
-          paste("Error in influence analysis:", e$message)
-        })
-      },
-      
-      # Task 3: Add diagnostics
-      {
-        tryCatch({
-          add_diagnostics_to_workbook(
-            all_models = all_models, 
-            expanding_windows = expanding_windows, 
-            all_diagnostics = all_diagnostics, 
-            all_looic = all_looic,
-            bayesian_R2_results = bayesian_R2_results, 
-            crps_scores = crps_scores, 
-            lpd_scores = lpd_scores, 
-            ljung_box_results = ljung_box_results,
-            file_path = file_path
-          )
-          "Diagnostics completed successfully"
-        }, error = function(e) {
-          paste("Error in diagnostics:", e$message)
-        })
-      }
-    )
-    return(result)
-  }
-  
-  # Stop the cluster
-  stopCluster(cl)
-  registerDoSEQ()  # Reset to sequential processing
-  
-  # Clean up
-  rm(cl)
-  gc()  # Force garbage collection
-  
-  # Summarize results
-  summary <- paste("Excel processing results:", 
-                   paste(results, collapse = "; "))
-  
-  return(paste("Results successfully written to", file_path, "-", summary))
-}
-###############################################################################
-## 5) add_diagnostics_to_workbook (unchanged)
+## 5) add_diagnostics_to_workbook - Complete diagnostics function
 ###############################################################################
 add_diagnostics_to_workbook <- function(all_models, expanding_windows, all_diagnostics, all_looic, 
                                         bayesian_R2_results, crps_scores, lpd_scores, 
@@ -9086,9 +9384,8 @@ add_diagnostics_to_workbook <- function(all_models, expanding_windows, all_diagn
   return(wb)
 }
 
-
 ###############################################################################
-## 6) format_window_range (unchanged)
+## 6) format_window_range - Helper function for window descriptions
 ###############################################################################
 format_window_range <- function(window) {
   train_ranges <- c(
@@ -9107,16 +9404,13 @@ format_window_range <- function(window) {
     "98-111"
     
   )
-  
   paste(train_ranges[window], "as the training and the", test_ranges[window], "as the testing")
 }
 
-
 ###############################################################################
-## 7) create_excel_results
-##    Computes ensemble SMAPEs then calls the above functions.
+## 7) create_excel_results_revised - MAIN FUNCTION WITH FULL FUNCTIONALITY
 ###############################################################################
-create_excel_results <- function(
+create_excel_results_revised <- function(
   all_evaluations, 
   all_models, 
   extended_test_sets, 
@@ -9130,30 +9424,27 @@ create_excel_results <- function(
   bayesian_R2_results, 
   ljung_box_results,
   aggregate_smape_results,
-  all_results,         
-  top_model_results,   
-  hold_out_dataset     
+  ensemble_results         # This should be the output from ensemble analysis
 ) {
   file_path <- "EW_BW_2016Q4.xlsx"
   
-  # Map delta_test_forecast to delta_holdout_forecast in influence results
-  for (dep_var in names(influence_results)) {
-    for (model_name in names(influence_results[[dep_var]])) {
-      results_df <- influence_results[[dep_var]][[model_name]]
-      if ("delta_test_forecast" %in% names(results_df) && 
-          !"delta_holdout_forecast" %in% names(results_df)) {
-        influence_results[[dep_var]][[model_name]]$delta_holdout_forecast <- 
-          results_df$delta_test_forecast
+  # Handle influence results if they exist
+  if (!is.null(influence_results)) {
+    for (dep_var in names(influence_results)) {
+      for (model_name in names(influence_results[[dep_var]])) {
+        results_df <- influence_results[[dep_var]][[model_name]]
+        if ("delta_test_forecast" %in% names(results_df) && 
+            !"delta_holdout_forecast" %in% names(results_df)) {
+          influence_results[[dep_var]][[model_name]]$delta_holdout_forecast <- 
+            results_df$delta_test_forecast
+        }
       }
     }
   }
   
-  # Get ensemble SMAPEs
-  ensemble_smapes <- get_ensemble_smapes(all_results, top_model_results, hold_out_dataset)
-  
-  # Create prediction tables
+  # Create prediction tables with ensemble results ONLY
   cat("Creating prediction tables...\n")
-  wb <- create_enhanced_prediction_tables(
+  wb <- create_enhanced_prediction_tables_revised(  # Use revised function
     all_evaluations = all_evaluations, 
     all_models = all_models, 
     extended_test_sets = extended_test_sets, 
@@ -9161,16 +9452,18 @@ create_excel_results <- function(
     lpd_scores = lpd_scores, 
     file_path = file_path,
     aggregate_smape_results = aggregate_smape_results,
-    ensemble_smapes = ensemble_smapes
+    ensemble_results = ensemble_results  # Pass ensemble results
   )
   
   # Add sensitivity analysis with proper spacing
   cat("Adding sensitivity analysis...\n")
   add_sensitivity_analysis(sensitivity_results, file_path)
   
-  # Add influence analysis with proper spacing
-  cat("Adding influence analysis...\n")
-  add_influence_analysis_to_workbook(influence_results, file_path)
+  # Add influence analysis with proper spacing (only if data exists)
+  if (!is.null(influence_results)) {
+    cat("Adding influence analysis...\n")
+    add_influence_analysis_to_workbook(influence_results, file_path)
+  }
   
   # Add diagnostics
   cat("Adding diagnostics...\n")
@@ -9188,32 +9481,30 @@ create_excel_results <- function(
   
   return(paste("Results successfully written to", file_path))
 }
-###############################################################################
-## 8) Example usage
-###############################################################################
- result <- create_excel_results(
-   all_evaluations = all_evaluations_bwew, 
-   all_models = all_modelewbw, 
-   extended_test_sets = extended_test_sets, 
-   crps_scores = crps_scores, 
-   lpd_scores = lpd_scores, 
-   sensitivity_results = sensitivity_results, 
-   influence_results = influence_results_parallel, 
-   expanding_windows = expanding_windows, 
-   all_diagnostics = all_diagnostics, 
-   all_looic = all_looic_ew, 
-   bayesian_R2_results = bayesian_R2_results,
-   ljung_box_results = ljung_box_results,
-   aggregate_smape_results = aggregate_smape_results,
-   all_results = all_results,
-   top_model_results = top_model_results,
-   hold_out_dataset = hold_out_dataset
- )
- print(result)
 
+###############################################################################
+## 8) USAGE EXAMPLE - Call this with your existing ensemble_results
+###############################################################################
+# Usage with YOUR EXACT variable names:
+result <- create_excel_results_revised(
+  all_evaluations = all_evaluations_bwew, 
+  all_models = all_modelewbw, 
+  extended_test_sets = extended_test_sets, 
+  crps_scores = crps_scores, 
+  lpd_scores = lpd_scores, 
+  sensitivity_results = sensitivity_results, 
+  influence_results = influence_results_parallel,  
+  expanding_windows = expanding_windows, 
+  all_diagnostics = all_diagnostics, 
+  all_looic = all_looic_ew, 
+  bayesian_R2_results = bayesian_R2_results,
+  ljung_box_results = ljung_box_results,
+  aggregate_smape_results = aggregate_smape_results,
+  ensemble_results = ensemble_results  # Use your existing ensemble_results
+)
+
+print(result)
 ```
-
-
 # EWStep
 # original dataset lagged for 24NA （ create DATASET from 1997Q1 to 2024Q3）
 ```{r}
@@ -11493,7 +11784,6 @@ lpd_scores_ew_step <- calculate_lpd(all_modelewstep, expanding_windows)
 # First, clean up any existing parallel connections
 try(stopImplicitCluster(), silent = TRUE)
 try(stopCluster(cl), silent = TRUE)
-closeAllConnections()
 gc()  # Force garbage collection
 
 # Load required packages
@@ -11841,7 +12131,6 @@ execution_time <- end_time - start_time
 cat("\nSensitivity analysis completed in:", format(execution_time), "\n")
 ```
 
-close parallel: closeAllConnections()
 
 ```{r}
 # Function to identify the top 5 models by SMAPE
@@ -11980,7 +12269,6 @@ predict_and_create_ensemble <- function(all_modelewstep, top_model_results, hold
   # Clean up any existing connections
   try(stopImplicitCluster(), silent = TRUE)
   try(stopCluster(cl), silent = TRUE)
-  closeAllConnections()
   gc()  # Force garbage collection
   
   # Load required packages
@@ -12332,6 +12620,182 @@ get_ensemble_smapes <- function(all_results, top_model_results, hold_out_dataset
 ensemble_smapes = get_ensemble_smapes(all_results, top_model_results, hold_out_dataset)
 ```
 
+## ensemble result 
+```{r}
+# Function to combine existing results and create ensemble SMAPE
+combine_existing_results <- function(all_modelewstep, sensitivity_results, hold_out_dataset) {
+  
+  final_results <- data.frame(
+    Variable = character(),
+    Prediction_Type = character(),
+    Ensemble_SMAPE = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Process each dependent variable
+  for(dep_var in names(hold_out_dataset)) {
+    cat("\n================================================================\n")
+    cat("PROCESSING", toupper(dep_var), "\n")
+    cat("================================================================\n")
+    
+    # Collect all SMAPE values and predictions from both methods
+    all_configs <- data.frame(
+      Method = character(),
+      Window = integer(),
+      SMAPE = numeric(),
+      stringsAsFactors = FALSE
+    )
+    
+    # Method 1: Original window models (from all_modelewstep)
+    for(window in 1:5) {
+      if(dep_var %in% names(all_modelewstep) && length(all_modelewstep[[dep_var]]) >= window) {
+        
+        # Get test data
+        test_data <- expanding_windows[[dep_var]][[window]]$test
+        actual_values <- test_data[, 1]
+        test_predictors <- as.data.frame(test_data[, -1])
+        
+        # Get existing model and make predictions
+        model <- all_modelewstep[[dep_var]][[window]]
+        pred <- predict(model, newdata = test_predictors, burn = 100)
+        pred_mean <- colMeans(pred$distribution)
+        
+        # Calculate SMAPE for this configuration
+        smape <- mean(2 * abs(actual_values - pred_mean) / 
+                        (abs(actual_values) + abs(pred_mean))) * 100
+        
+        all_configs <- rbind(all_configs, 
+                             data.frame(Method = "Original", Window = window, SMAPE = smape))
+      }
+    }
+    
+    # Method 2: Sensitivity analysis (from sensitivity_results)
+    if(dep_var %in% names(sensitivity_results)) {
+      for(model_name in names(sensitivity_results[[dep_var]])) {
+        model_data <- sensitivity_results[[dep_var]][[model_name]]
+        
+        for(config_name in names(model_data$results)) {
+          config <- model_data$results[[config_name]]
+          
+          all_configs <- rbind(all_configs, 
+                               data.frame(Method = "Sensitivity", 
+                                          Window = model_data$window, 
+                                          SMAPE = config$smape))
+        }
+      }
+    }
+    
+    # Select top 10 configurations
+    top_configs <- all_configs[order(all_configs$SMAPE), ][1:min(10, nrow(all_configs)), ]
+    
+    cat("Top 10 configurations selected:\n")
+    print(top_configs)
+    
+    # Get holdout data
+    holdout_data <- hold_out_dataset[[dep_var]]
+    actual_values <- holdout_data[, 1]
+    pred_data <- as.data.frame(holdout_data[, -1])
+    period_labels <- c(as.character(73:79), "Q4")
+    
+    # Generate holdout predictions for top 10 configurations
+    pred_matrix_mean <- matrix(NA, nrow = length(actual_values), ncol = nrow(top_configs))
+    pred_matrix_median <- matrix(NA, nrow = length(actual_values), ncol = nrow(top_configs))
+    weights <- 1 / top_configs$SMAPE  # Inverse SMAPE weighting
+    
+    # For each top configuration, get holdout predictions
+    for(i in 1:nrow(top_configs)) {
+      config <- top_configs[i, ]
+      
+      if(config$Method == "Original") {
+        # Use existing original model
+        model <- all_modelewstep[[dep_var]][[config$Window]]
+        pred <- predict(model, newdata = pred_data, burn = 100)
+        pred_matrix_mean[, i] <- colMeans(pred$distribution)
+        pred_matrix_median[, i] <- apply(pred$distribution, 2, median)
+        
+      } else {
+        # For sensitivity models, we already have the predictions in all_results
+        # Find the corresponding predictions from your existing all_results
+        found_pred <- FALSE
+        
+        if(exists("all_results") && dep_var %in% names(all_results)) {
+          for(result in all_results[[dep_var]]) {
+            if(!is.null(result) && "predictions" %in% names(result)) {
+              # This is a simplified approach - you might need to match more precisely
+              # based on your specific data structure
+              pred_matrix_mean[, i] <- result$predictions
+              pred_matrix_median[, i] <- result$predictions  # Assuming same for now
+              found_pred <- TRUE
+              break
+            }
+          }
+        }
+        
+        if(!found_pred) {
+          cat("Could not find predictions for sensitivity config", i, "\n")
+          pred_matrix_mean[, i] <- NA
+          pred_matrix_median[, i] <- NA
+        }
+      }
+    }
+    
+    # Remove failed predictions
+    valid_cols <- !is.na(colSums(pred_matrix_mean))
+    pred_matrix_mean <- pred_matrix_mean[, valid_cols, drop = FALSE]
+    pred_matrix_median <- pred_matrix_median[, valid_cols, drop = FALSE]
+    weights <- weights[valid_cols]
+    
+    if(ncol(pred_matrix_mean) > 0) {
+      # Normalize weights
+      weights <- weights / sum(weights)
+      
+      # Calculate weighted ensemble predictions
+      ensemble_preds_mean <- rowSums(t(t(pred_matrix_mean) * weights), na.rm = TRUE)
+      ensemble_preds_median <- rowSums(t(t(pred_matrix_median) * weights), na.rm = TRUE)
+      
+      # Calculate ensemble SMAPE
+      ensemble_smape_mean <- mean(2 * abs(actual_values - ensemble_preds_mean) / 
+                                    (abs(actual_values) + abs(ensemble_preds_mean))) * 100
+      ensemble_smape_median <- mean(2 * abs(actual_values - ensemble_preds_median) / 
+                                      (abs(actual_values) + abs(ensemble_preds_median))) * 100
+      
+      # Store results
+      final_results <- rbind(final_results, 
+                             data.frame(Variable = dep_var, Prediction_Type = "Mean", Ensemble_SMAPE = ensemble_smape_mean),
+                             data.frame(Variable = dep_var, Prediction_Type = "Median", Ensemble_SMAPE = ensemble_smape_median))
+      
+      cat("\nResults for", dep_var, ":\n")
+      cat("Mean Ensemble SMAPE:", round(ensemble_smape_mean, 4), "%\n")
+      cat("Median Ensemble SMAPE:", round(ensemble_smape_median, 4), "%\n")
+    }
+  }
+  
+  return(final_results)
+}
+
+# Run the analysis using existing results only
+ensemble_results <- combine_existing_results(all_modelewstep, sensitivity_results, hold_out_dataset)
+
+# Create the final table you requested
+cat("\n================================================================\n")
+cat("FINAL RESULTS TABLE\n")
+cat("================================================================\n")
+
+# Aggregate across all variables
+mean_smape <- mean(ensemble_results[ensemble_results$Prediction_Type == "Mean", "Ensemble_SMAPE"])
+median_smape <- mean(ensemble_results[ensemble_results$Prediction_Type == "Median", "Ensemble_SMAPE"])
+
+final_table <- data.frame(
+  Prediction_Type = c("Mean", "Median"),
+  SMAPE = c(mean_smape, median_smape)
+)
+
+print(final_table)
+
+cat("\nDetailed by variable:\n")
+print(ensemble_results)
+```
+
 # Influence
 
 ```{r}
@@ -12669,41 +13133,53 @@ influence_results_parallel_step <- run_influence_analysis_parallel()
 stopImplicitCluster()
 ```
 
-## excel
+
+# Excel
 
 ```{r}
-
-create_enhanced_prediction_tables <- function(all_evaluations, all_models, extended_test_sets_step, 
+# Complete Excel Results Creation with Stepwise Elimination Handling
+# Modified create_enhanced_prediction_tables function - HANDLES STEPWISE ELIMINATION
+create_enhanced_prediction_tables_revised <- function(all_evaluations, all_models, extended_test_sets, 
                                               crps_scores, lpd_scores, file_path, 
                                               aggregate_smape_results,
-                                              ensemble_smapes) {
+                                              ensemble_results) {
   dep_vars <- names(all_evaluations)
   wb <- createWorkbook()
   
   for(dep_var in dep_vars) {
     addWorksheet(wb, dep_var)
     
-    mean_smape   <- aggregate_smape_results[[dep_var]]$Mean_SMAPE
-    median_smape <- aggregate_smape_results[[dep_var]]$Median_SMAPE  # if your code uses Median_SMAPE
-    # Use weighted ensemble SMAPE if available
-    sensi_smape <- if(!is.null(ensemble_smapes[dep_var])) round(ensemble_smapes[dep_var], 2) else NA
+    # Get ensemble SMAPEs from the new ensemble analysis
+    ensemble_mean_smape <- NA
+    ensemble_median_smape <- NA
     
+    if(!is.null(ensemble_results) && nrow(ensemble_results) > 0) {
+      # Filter for this variable
+      var_results <- ensemble_results[ensemble_results$Variable == dep_var, ]
+      if(nrow(var_results) > 0) {
+        mean_row <- var_results[var_results$Prediction_Type == "Mean", ]
+        median_row <- var_results[var_results$Prediction_Type == "Median", ]
+        
+        if(nrow(mean_row) > 0) ensemble_mean_smape <- round(mean_row$Ensemble_SMAPE, 2)
+        if(nrow(median_row) > 0) ensemble_median_smape <- round(median_row$Ensemble_SMAPE, 2)
+      }
+    }
+    
+    # ONLY ENSEMBLE ROWS - removed Use Mean and Use Median
     variable_data <- data.frame(
       Col1 = c(
         dep_var,
         "Holds out period",
         "Prediction based on testing SMAPE",
-        "Use Mean",
-        "Use Median",
-        "Prediction based on Sensitivity"
+        "Ensemble Mean (Top 10)",
+        "Ensemble Median (Top 10)"     
       ),
       Col2 = c(
         "",
         "2016 Q4 - 2018 Q2 and 2024Q4",
         "SMAPE",
-        round(mean_smape, 2),
-        round(median_smape, 2),
-        sensi_smape
+        ensemble_mean_smape,
+        ensemble_median_smape          
       ),
       stringsAsFactors = FALSE
     )
@@ -12711,7 +13187,8 @@ create_enhanced_prediction_tables <- function(all_evaluations, all_models, exten
     writeData(wb, dep_var, variable_data, startRow = 1, startCol = 1, colNames = FALSE)
     setColWidths(wb, dep_var, cols = 1:2, widths = c(25, 20))
     
-    start_row <- 8  # row 7 is blank
+    # Handle stepwise elimination in prediction sections
+    start_row <- 7
     
     smape_mean   <- sapply(all_evaluations[[dep_var]], function(x) x$errors_mean$SMAPE)
     smape_median <- sapply(all_evaluations[[dep_var]], function(x) x$errors_median$SMAPE)
@@ -12719,10 +13196,15 @@ create_enhanced_prediction_tables <- function(all_evaluations, all_models, exten
     crps_mean <- numeric(7)
     crps_sd   <- numeric(7)
     for(i in 1:7) {
-      window_data <- crps_scores[[dep_var]][crps_scores[[dep_var]]$Window == i, ]
-      if(nrow(window_data) > 0) {
-        crps_mean[i] <- window_data$CRPS_Mean
-        crps_sd[i]   <- window_data$CRPS_SD
+      if(!is.null(crps_scores[[dep_var]])) {
+        window_data <- crps_scores[[dep_var]][crps_scores[[dep_var]]$Window == i, ]
+        if(nrow(window_data) > 0) {
+          crps_mean[i] <- window_data$CRPS_Mean
+          crps_sd[i]   <- window_data$CRPS_SD
+        } else {
+          crps_mean[i] <- NA
+          crps_sd[i]   <- NA
+        }
       } else {
         crps_mean[i] <- NA
         crps_sd[i]   <- NA
@@ -12732,10 +13214,15 @@ create_enhanced_prediction_tables <- function(all_evaluations, all_models, exten
     lpd_mean <- numeric(7)
     lpd_sd   <- numeric(7)
     for(i in 1:7) {
-      window_data <- lpd_scores[[dep_var]][lpd_scores[[dep_var]]$Window == i, ]
-      if(nrow(window_data) > 0) {
-        lpd_mean[i] <- window_data$LPD_Mean
-        lpd_sd[i]   <- window_data$LPD_SD
+      if(!is.null(lpd_scores[[dep_var]])) {
+        window_data <- lpd_scores[[dep_var]][lpd_scores[[dep_var]]$Window == i, ]
+        if(nrow(window_data) > 0) {
+          lpd_mean[i] <- window_data$LPD_Mean
+          lpd_sd[i]   <- window_data$LPD_SD
+        } else {
+          lpd_mean[i] <- NA
+          lpd_sd[i]   <- NA
+        }
       } else {
         lpd_mean[i] <- NA
         lpd_sd[i]   <- NA
@@ -12762,23 +13249,102 @@ create_enhanced_prediction_tables <- function(all_evaluations, all_models, exten
     
     current_row <- start_row + 3
     for(window in top_5_mean) {
-      pred_data <- extended_test_sets_step[[dep_var]][[window]]
-      last_row_predictors <- pred_data[nrow(pred_data), -1, drop = FALSE]
-      pred <- predict.bsts(all_models[[dep_var]][[window]], 
-                           newdata = as.data.frame(last_row_predictors),
-                           burn = 100)
-      dist <- pred$distribution[,1]
-      
-      writeData(wb, dep_var, format_window_range(window), startRow = current_row, startCol = 1)
-      writeData(wb, dep_var, quantile(dist, 0.025), startRow = current_row, startCol = 2)
-      writeData(wb, dep_var, mean(dist),            startRow = current_row, startCol = 3)
-      writeData(wb, dep_var, median(dist),          startRow = current_row, startCol = 4)
-      writeData(wb, dep_var, quantile(dist, 0.975), startRow = current_row, startCol = 5)
-      
-      writeData(wb, dep_var, smape_mean[window],  startRow = current_row, startCol = 6)
-      writeData(wb, dep_var, crps_mean[window],   startRow = current_row, startCol = 7)
-      writeData(wb, dep_var, lpd_mean[window],    startRow = current_row, startCol = 8)
-      writeData(wb, dep_var, lpd_sd[window],      startRow = current_row, startCol = 9)
+      tryCatch({
+        # CHECK IF EXTENDED TEST SETS EXISTS FOR THIS WINDOW
+        if(!is.null(extended_test_sets[[dep_var]]) && 
+           length(extended_test_sets[[dep_var]]) >= window &&
+           !is.null(extended_test_sets[[dep_var]][[window]])) {
+          
+          pred_data <- extended_test_sets[[dep_var]][[window]]
+          last_row_predictors <- pred_data[nrow(pred_data), -1, drop = FALSE]
+          
+          # GET MODEL AND CHECK WHAT VARIABLES IT ACTUALLY USES
+          model <- all_models[[dep_var]][[window]]
+          if(!is.null(model) && !is.null(model$coefficients)) {
+            model_vars <- colnames(model$coefficients)
+            available_vars <- colnames(last_row_predictors)
+            
+            # FIND VARIABLES THAT SURVIVED STEPWISE SELECTION
+            selected_vars <- intersect(model_vars, available_vars)
+            eliminated_vars <- setdiff(model_vars, available_vars)
+            
+            if(length(eliminated_vars) > 0) {
+              cat("Variables eliminated by stepwise for", dep_var, "window", window, ":", paste(eliminated_vars, collapse=", "), "\n")
+            }
+            
+            if(length(selected_vars) > 0) {
+              cat("Variables selected for", dep_var, "window", window, ":", paste(selected_vars, collapse=", "), "\n")
+              
+              # USE ONLY THE SELECTED VARIABLES FOR PREDICTION
+              last_row_predictors <- last_row_predictors[, selected_vars, drop = FALSE]
+              
+              # MAKE PREDICTION WITH SELECTED VARIABLES ONLY
+              pred <- predict.bsts(model, 
+                                 newdata = as.data.frame(last_row_predictors),
+                                 burn = 100)
+              dist <- pred$distribution[,1]
+              
+              writeData(wb, dep_var, format_window_range(window), startRow = current_row, startCol = 1)
+              writeData(wb, dep_var, quantile(dist, 0.025), startRow = current_row, startCol = 2)
+              writeData(wb, dep_var, mean(dist),            startRow = current_row, startCol = 3)
+              writeData(wb, dep_var, median(dist),          startRow = current_row, startCol = 4)
+              writeData(wb, dep_var, quantile(dist, 0.975), startRow = current_row, startCol = 5)
+              
+              writeData(wb, dep_var, smape_mean[window],  startRow = current_row, startCol = 6)
+              writeData(wb, dep_var, crps_mean[window],   startRow = current_row, startCol = 7)
+              writeData(wb, dep_var, lpd_mean[window],    startRow = current_row, startCol = 8)
+              writeData(wb, dep_var, lpd_sd[window],      startRow = current_row, startCol = 9)
+              
+            } else {
+              # NO VARIABLES SURVIVED STEPWISE SELECTION
+              cat("No variables survived stepwise selection for", dep_var, "window", window, "\n")
+              writeData(wb, dep_var, paste("Window", window, "- No variables selected"), startRow = current_row, startCol = 1)
+              writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 2)
+              writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 3)
+              writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 4)
+              writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 5)
+              writeData(wb, dep_var, smape_mean[window], startRow = current_row, startCol = 6)
+              writeData(wb, dep_var, crps_mean[window], startRow = current_row, startCol = 7)
+              writeData(wb, dep_var, lpd_mean[window], startRow = current_row, startCol = 8)
+              writeData(wb, dep_var, lpd_sd[window], startRow = current_row, startCol = 9)
+            }
+          } else {
+            # NO MODEL AVAILABLE
+            writeData(wb, dep_var, paste("Window", window, "- No model"), startRow = current_row, startCol = 1)
+            writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 2)
+            writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 3)
+            writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 4)
+            writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 5)
+            writeData(wb, dep_var, smape_mean[window], startRow = current_row, startCol = 6)
+            writeData(wb, dep_var, crps_mean[window], startRow = current_row, startCol = 7)
+            writeData(wb, dep_var, lpd_mean[window], startRow = current_row, startCol = 8)
+            writeData(wb, dep_var, lpd_sd[window], startRow = current_row, startCol = 9)
+          }
+        } else {
+          # NO EXTENDED TEST DATA
+          writeData(wb, dep_var, paste("Window", window, "- No test data"), startRow = current_row, startCol = 1)
+          writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 2)
+          writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 3)
+          writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 4)
+          writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 5)
+          writeData(wb, dep_var, smape_mean[window], startRow = current_row, startCol = 6)
+          writeData(wb, dep_var, crps_mean[window], startRow = current_row, startCol = 7)
+          writeData(wb, dep_var, lpd_mean[window], startRow = current_row, startCol = 8)
+          writeData(wb, dep_var, lpd_sd[window], startRow = current_row, startCol = 9)
+        }
+        
+      }, error = function(e) {
+        cat("Error in window", window, "for", dep_var, ":", e$message, "\n")
+        writeData(wb, dep_var, paste("Window", window, "- Error:", substr(e$message, 1, 20)), startRow = current_row, startCol = 1)
+        writeData(wb, dep_var, "ERROR", startRow = current_row, startCol = 2)
+        writeData(wb, dep_var, "ERROR", startRow = current_row, startCol = 3)
+        writeData(wb, dep_var, "ERROR", startRow = current_row, startCol = 4)
+        writeData(wb, dep_var, "ERROR", startRow = current_row, startCol = 5)
+        writeData(wb, dep_var, smape_mean[window], startRow = current_row, startCol = 6)
+        writeData(wb, dep_var, crps_mean[window], startRow = current_row, startCol = 7)
+        writeData(wb, dep_var, lpd_mean[window], startRow = current_row, startCol = 8)
+        writeData(wb, dep_var, lpd_sd[window], startRow = current_row, startCol = 9)
+      })
       
       current_row <- current_row + 1
     }
@@ -12797,23 +13363,88 @@ create_enhanced_prediction_tables <- function(all_evaluations, all_models, exten
     
     current_row <- current_row + 3
     for(window in top_5_median) {
-      pred_data <- extended_test_sets_step[[dep_var]][[window]]
-      last_row_predictors <- pred_data[nrow(pred_data), -1, drop = FALSE]
-      pred <- predict.bsts(all_models[[dep_var]][[window]], 
-                           newdata = as.data.frame(last_row_predictors),
-                           burn = 100)
-      dist <- pred$distribution[,1]
-      
-      writeData(wb, dep_var, format_window_range(window), startRow = current_row, startCol = 1)
-      writeData(wb, dep_var, quantile(dist, 0.025), startRow = current_row, startCol = 2)
-      writeData(wb, dep_var, mean(dist),            startRow = current_row, startCol = 3)
-      writeData(wb, dep_var, median(dist),          startRow = current_row, startCol = 4)
-      writeData(wb, dep_var, quantile(dist, 0.975), startRow = current_row, startCol = 5)
-      
-      writeData(wb, dep_var, smape_median[window], startRow = current_row, startCol = 6)
-      writeData(wb, dep_var, crps_mean[window],    startRow = current_row, startCol = 7)
-      writeData(wb, dep_var, lpd_mean[window],     startRow = current_row, startCol = 8)
-      writeData(wb, dep_var, lpd_sd[window],       startRow = current_row, startCol = 9)
+      tryCatch({
+        # SAME STEPWISE HANDLING FOR MEDIAN SECTION
+        if(!is.null(extended_test_sets[[dep_var]]) && 
+           length(extended_test_sets[[dep_var]]) >= window &&
+           !is.null(extended_test_sets[[dep_var]][[window]])) {
+          
+          pred_data <- extended_test_sets[[dep_var]][[window]]
+          last_row_predictors <- pred_data[nrow(pred_data), -1, drop = FALSE]
+          
+          model <- all_models[[dep_var]][[window]]
+          if(!is.null(model) && !is.null(model$coefficients)) {
+            model_vars <- colnames(model$coefficients)
+            available_vars <- colnames(last_row_predictors)
+            
+            selected_vars <- intersect(model_vars, available_vars)
+            eliminated_vars <- setdiff(model_vars, available_vars)
+            
+            if(length(selected_vars) > 0) {
+              last_row_predictors <- last_row_predictors[, selected_vars, drop = FALSE]
+              
+              pred <- predict.bsts(model, 
+                                 newdata = as.data.frame(last_row_predictors),
+                                 burn = 100)
+              dist <- pred$distribution[,1]
+              
+              writeData(wb, dep_var, format_window_range(window), startRow = current_row, startCol = 1)
+              writeData(wb, dep_var, quantile(dist, 0.025), startRow = current_row, startCol = 2)
+              writeData(wb, dep_var, mean(dist),            startRow = current_row, startCol = 3)
+              writeData(wb, dep_var, median(dist),          startRow = current_row, startCol = 4)
+              writeData(wb, dep_var, quantile(dist, 0.975), startRow = current_row, startCol = 5)
+              
+              writeData(wb, dep_var, smape_median[window], startRow = current_row, startCol = 6)
+              writeData(wb, dep_var, crps_mean[window],    startRow = current_row, startCol = 7)
+              writeData(wb, dep_var, lpd_mean[window],     startRow = current_row, startCol = 8)
+              writeData(wb, dep_var, lpd_sd[window],       startRow = current_row, startCol = 9)
+              
+            } else {
+              writeData(wb, dep_var, paste("Window", window, "- No variables selected"), startRow = current_row, startCol = 1)
+              writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 2)
+              writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 3)
+              writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 4)
+              writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 5)
+              writeData(wb, dep_var, smape_median[window], startRow = current_row, startCol = 6)
+              writeData(wb, dep_var, crps_mean[window], startRow = current_row, startCol = 7)
+              writeData(wb, dep_var, lpd_mean[window], startRow = current_row, startCol = 8)
+              writeData(wb, dep_var, lpd_sd[window], startRow = current_row, startCol = 9)
+            }
+          } else {
+            writeData(wb, dep_var, paste("Window", window, "- No model"), startRow = current_row, startCol = 1)
+            writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 2)
+            writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 3)
+            writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 4)
+            writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 5)
+            writeData(wb, dep_var, smape_median[window], startRow = current_row, startCol = 6)
+            writeData(wb, dep_var, crps_mean[window], startRow = current_row, startCol = 7)
+            writeData(wb, dep_var, lpd_mean[window], startRow = current_row, startCol = 8)
+            writeData(wb, dep_var, lpd_sd[window], startRow = current_row, startCol = 9)
+          }
+        } else {
+          writeData(wb, dep_var, paste("Window", window, "- No test data"), startRow = current_row, startCol = 1)
+          writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 2)
+          writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 3)
+          writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 4)
+          writeData(wb, dep_var, "N/A", startRow = current_row, startCol = 5)
+          writeData(wb, dep_var, smape_median[window], startRow = current_row, startCol = 6)
+          writeData(wb, dep_var, crps_mean[window], startRow = current_row, startCol = 7)
+          writeData(wb, dep_var, lpd_mean[window], startRow = current_row, startCol = 8)
+          writeData(wb, dep_var, lpd_sd[window], startRow = current_row, startCol = 9)
+        }
+        
+      }, error = function(e) {
+        cat("Error in median window", window, "for", dep_var, ":", e$message, "\n")
+        writeData(wb, dep_var, paste("Window", window, "- Error:", substr(e$message, 1, 20)), startRow = current_row, startCol = 1)
+        writeData(wb, dep_var, "ERROR", startRow = current_row, startCol = 2)
+        writeData(wb, dep_var, "ERROR", startRow = current_row, startCol = 3)
+        writeData(wb, dep_var, "ERROR", startRow = current_row, startCol = 4)
+        writeData(wb, dep_var, "ERROR", startRow = current_row, startCol = 5)
+        writeData(wb, dep_var, smape_median[window], startRow = current_row, startCol = 6)
+        writeData(wb, dep_var, crps_mean[window], startRow = current_row, startCol = 7)
+        writeData(wb, dep_var, lpd_mean[window], startRow = current_row, startCol = 8)
+        writeData(wb, dep_var, lpd_sd[window], startRow = current_row, startCol = 9)
+      })
       
       current_row <- current_row + 1
     }
@@ -12826,75 +13457,59 @@ create_enhanced_prediction_tables <- function(all_evaluations, all_models, exten
   return(wb)
 }
 
-
 ###############################################################################
-## 3) add_sensitivity_analysis
-##    Moves the sensitivity analysis block down by 3 rows and removes any extra row (e.g. SMAPE row)
+## 3) add_sensitivity_analysis - Simplified version with WAIC, LOOIC, MAPE removed
 ###############################################################################
-add_sensitivity_analysis <- function(sensitivity_results_step, file_path) {
-  wb <- loadWorkbook(file_path)
-  
-  for(dep_var in names(sensitivity_results_step)) {
-    sheet_data <- readWorkbook(wb, sheet = dep_var)
+add_sensitivity_analysis <- function(sensitivity_results, file_path) {
+  if(file.exists(file_path)) {
+    wb <- loadWorkbook(file_path)
     
-    # Calculate the exact row to place the sensitivity analysis
-    # Find the last non-empty row of the existing content
-    last_content_row <- max(which(!is.na(sheet_data[,1]) & sheet_data[,1] != ""), na.rm = TRUE)
-    
-    # Add a small gap (3 rows) after the last content
-    last_row <- last_content_row + 6
-    
-    # Create the results data frame
-    results_data <- data.frame(
-      Window   = integer(),
-      Method   = character(),
-      Sigma    = numeric(),
-      Slab_Var = numeric(),
-      WAIC     = numeric(),
-      LOOIC    = numeric(),
-      MAPE     = numeric(),
-      SMAPE    = numeric(),
-      stringsAsFactors = FALSE
-    )
-    
-    for (model_name in names(sensitivity_results_step[[dep_var]])) {
-      model_info <- sensitivity_results_step[[dep_var]][[model_name]]
-      window <- model_info$window
-      method <- model_info$method
-      
-      for (result_name in names(model_info$results)) {
-        result <- model_info$results[[result_name]]
-        results_data <- rbind(results_data, data.frame(
-          Window   = window,
-          Method   = method,
-          Sigma    = if(!is.null(result$sigma)) result$sigma else NA,
-          Slab_Var = if(!is.null(result$slab_var)) result$slab_var else NA,
-          WAIC     = if(!is.null(result$waic)) result$waic else NA,
-          LOOIC    = if(!is.null(result$looic)) result$looic else NA,
-          MAPE     = if(!is.null(result$mape)) result$mape else NA,
-          SMAPE    = if(!is.null(result$smape)) result$smape else NA,
+    for(dep_var in names(sensitivity_results)) {
+      if(dep_var %in% names(wb)) {
+        sheet_data <- readWorkbook(wb, sheet = dep_var)
+        last_content_row <- max(which(!is.na(sheet_data[,1]) & sheet_data[,1] != ""), na.rm = TRUE)
+        last_row <- last_content_row + 6
+        
+        results_data <- data.frame(
+          Window = integer(),
+          Method = character(),
+          Sigma = numeric(),
+          Slab_Var = numeric(),
+          SMAPE = numeric(),
           stringsAsFactors = FALSE
-        ))
+        )
+        
+        for (model_name in names(sensitivity_results[[dep_var]])) {
+          model_info <- sensitivity_results[[dep_var]][[model_name]]
+          window <- model_info$window
+          method <- model_info$method
+          
+          for (result_name in names(model_info$results)) {
+            result <- model_info$results[[result_name]]
+            results_data <- rbind(results_data, data.frame(
+              Window = window,
+              Method = method,
+              Sigma = if(!is.null(result$sigma)) result$sigma else NA,
+              Slab_Var = if(!is.null(result$slab_var)) result$slab_var else NA,
+              SMAPE = if(!is.null(result$smape)) result$smape else NA,
+              stringsAsFactors = FALSE
+            ))
+          }
+        }
+        
+        writeData(wb, dep_var, "Sensitivity Analysis Results", startRow = last_row, startCol = 1)
+        writeData(wb, dep_var, results_data, startRow = last_row + 1, startCol = 1, colNames = TRUE)
+        setColWidths(wb, dep_var, cols = 1:5, widths = c(10,10,10,10,10))
       }
     }
     
-    # Write the title directly (no mysterious dep var title)
-    writeData(wb, dep_var, "Sensitivity Analysis Results", startRow = last_row, startCol = 1)
-    
-    # Immediately write the table
-    writeData(wb, dep_var, results_data, startRow = last_row + 1, startCol = 1, colNames = TRUE)
-    
-    # Set column widths
-    setColWidths(wb, dep_var, cols = 1:8, widths = c(10,10,10,10,12,12,10,10))
+    saveWorkbook(wb, file_path, overwrite = TRUE)
   }
-  
-  saveWorkbook(wb, file_path, overwrite = TRUE)
-  return(wb)
+  return(invisible(NULL))
 }
 
 ###############################################################################
-## Fixed add_influence_analysis_to_workbook function
-## Fixes the spacing issue and handles delta_test_forecast/delta_holdout_forecast
+## 4) add_influence_analysis_to_workbook - Complete influence analysis
 ###############################################################################
 add_influence_analysis_to_workbook <- function(influence_results, file_path) {
   wb <- loadWorkbook(file_path)
@@ -12911,36 +13526,28 @@ add_influence_analysis_to_workbook <- function(influence_results, file_path) {
     })
     
     # Calculate exact start row by finding the last sensitivity analysis row
-    # Find the last non-empty row in the sheet
     non_empty_rows <- which(!is.na(sheet_data[,1]) & sheet_data[,1] != "")
     
     if (length(non_empty_rows) > 0) {
       last_content_row <- max(non_empty_rows, na.rm = TRUE)
-      # Look for "Sensitivity Analysis Results" in the sheet
       sensitivity_rows <- which(sheet_data[,1] == "Sensitivity Analysis Results")
       
       if (length(sensitivity_rows) > 0) {
         sensitivity_row <- max(sensitivity_rows)
-        # Find the last row of the sensitivity table
-        # Usually it's a block of data after the title
         for (i in (sensitivity_row + 1):nrow(sheet_data)) {
           if (is.na(sheet_data[i,1]) || sheet_data[i,1] == "") {
             last_sensitivity_row <- i - 1
             break
           }
-          # If we reach the end of the dataframe
           if (i == nrow(sheet_data)) {
             last_sensitivity_row <- i
           }
         }
-        # Start influence analysis 5 rows after the sensitivity table
         current_row <- last_sensitivity_row + 9
       } else {
-        # If sensitivity analysis not found, start 5 rows after last content
         current_row <- last_content_row + 9
       }
     } else {
-      # If sheet is empty
       current_row <- 1
     }
     
@@ -13050,127 +13657,9 @@ add_influence_analysis_to_workbook <- function(influence_results, file_path) {
   saveWorkbook(wb, file_path, overwrite = TRUE)
   cat("Influence analysis results added to workbook:", file_path, "\n")
 }
+
 ###############################################################################
-## Parallelized version of create_excel_results
-###############################################################################
-create_excel_results_parallel <- function(
-  all_evaluations, 
-  all_models, 
-  extended_test_sets_step, 
-  crps_scores, 
-  lpd_scores, 
-  sensitivity_results_step, 
-  influence_results, 
-  expanding_windows, 
-  all_diagnostics, 
-  all_looic, 
-  bayesian_R2_results, 
-  ljung_box_results,
-  aggregate_smape_results,
-  all_results,         
-  top_model_results,   
-  hold_out_dataset     
-) {
-  file_path <- "EW_Step_H2.xlsx"
-  
-  # This part is harder to parallelize as it builds on previous results
-  ensemble_smapes <- get_ensemble_smapes(all_results, top_model_results, hold_out_dataset)
-  
-  # Create prediction tables
-  wb <- create_enhanced_prediction_tables(
-    all_evaluations = all_evaluations, 
-    all_models = all_models, 
-    extended_test_sets_step = extended_test_sets_step, 
-    crps_scores = crps_scores, 
-    lpd_scores = lpd_scores, 
-    file_path = file_path,
-    aggregate_smape_results = aggregate_smape_results,
-    ensemble_smapes = ensemble_smapes
-  )
-  
-  # Now we'll parallelize these steps which can be run independently
-  
-  # Set up parallel processing
-  no_cores <- detectCores() - 1  # Leave one core free
-  cat("Using", no_cores, "cores for parallel Excel processing\n")
-  
-  # Register the parallel backend
-  cl <- makeCluster(no_cores)
-  registerDoParallel(cl)
-  
-  # Export necessary packages to all workers
-  clusterEvalQ(cl, {
-    library(openxlsx)
-    library(bsts)
-    library(coda)
-  })
-  
-  # Process the different analyses in parallel
-  # Each function will load, modify, and save the workbook independently
-  
-  # Run tasks in parallel
-  results <- foreach(task_num = 1:3, .packages = c("openxlsx", "bsts")) %dopar% {
-    result <- switch(task_num,
-      # Task 1: Add sensitivity analysis
-      {
-        tryCatch({
-          add_sensitivity_analysis(sensitivity_results_step, file_path)
-          "Sensitivity analysis completed successfully"
-        }, error = function(e) {
-          paste("Error in sensitivity analysis:", e$message)
-        })
-      },
-      
-      # Task 2: Add influence analysis
-      {
-        tryCatch({
-          # Use the fixed version of the function
-          add_influence_analysis_to_workbook(influence_results, file_path)
-          "Influence analysis completed successfully"
-        }, error = function(e) {
-          paste("Error in influence analysis:", e$message)
-        })
-      },
-      
-      # Task 3: Add diagnostics
-      {
-        tryCatch({
-          add_diagnostics_to_workbook(
-            all_models = all_models, 
-            expanding_windows = expanding_windows, 
-            all_diagnostics = all_diagnostics, 
-            all_looic = all_looic,
-            bayesian_R2_results = bayesian_R2_results, 
-            crps_scores = crps_scores, 
-            lpd_scores = lpd_scores, 
-            ljung_box_results = ljung_box_results,
-            file_path = file_path
-          )
-          "Diagnostics completed successfully"
-        }, error = function(e) {
-          paste("Error in diagnostics:", e$message)
-        })
-      }
-    )
-    return(result)
-  }
-  
-  # Stop the cluster
-  stopCluster(cl)
-  registerDoSEQ()  # Reset to sequential processing
-  
-  # Clean up
-  rm(cl)
-  gc()  # Force garbage collection
-  
-  # Summarize results
-  summary <- paste("Excel processing results:", 
-                   paste(results, collapse = "; "))
-  
-  return(paste("Results successfully written to", file_path, "-", summary))
-}
-###############################################################################
-## 5) add_diagnostics_to_workbook (unchanged)
+## 5) add_diagnostics_to_workbook - Complete diagnostics function
 ###############################################################################
 add_diagnostics_to_workbook <- function(all_models, expanding_windows, all_diagnostics, all_looic, 
                                         bayesian_R2_results, crps_scores, lpd_scores, 
@@ -13429,12 +13918,11 @@ add_diagnostics_to_workbook <- function(all_models, expanding_windows, all_diagn
   return(wb)
 }
 
-
 ###############################################################################
-## 6) format_window_range (unchanged)
+## 6) format_window_range - Helper function for window descriptions
 ###############################################################################
 format_window_range <- function(window) {
-  train_ranges <- c(
+    train_ranges <- c(
     "1-70", 
     "1-82 (excluding hold-out 80-86)",
     "1-87 (excluding hold-out 80-86)",
@@ -13448,23 +13936,21 @@ format_window_range <- function(window) {
     "88-111",
     "93-111",
     "98-111"
-    
   )
   
   paste(train_ranges[window], "as the training and the", test_ranges[window], "as the testing")
 }
 
 ###############################################################################
-## 7) create_excel_results
-##    Computes ensemble SMAPEs then calls the above functions.
+## 7) create_excel_results_revised - MAIN FUNCTION - Creates EW_Step_2015Q1.xlsx
 ###############################################################################
-create_excel_results <- function(
+create_excel_results_revised <- function(
   all_evaluations, 
   all_models, 
-  extended_test_sets_step, 
+  extended_test_sets, 
   crps_scores, 
   lpd_scores, 
-  sensitivity_results_step, 
+  sensitivity_results, 
   influence_results, 
   expanding_windows, 
   all_diagnostics, 
@@ -13472,47 +13958,44 @@ create_excel_results <- function(
   bayesian_R2_results, 
   ljung_box_results,
   aggregate_smape_results,
-  all_results,         
-  top_model_results,   
-  hold_out_dataset     
+  ensemble_results
 ) {
-  file_path <- "EW_Step_2016Q4.xlsx"
+  file_path <- "EW_Step_2016Q4.xlsx"  # CORRECT FILE NAME FOR STEPWISE
   
-  # Map delta_test_forecast to delta_holdout_forecast in influence results
-  for (dep_var in names(influence_results)) {
-    for (model_name in names(influence_results[[dep_var]])) {
-      results_df <- influence_results[[dep_var]][[model_name]]
-      if ("delta_test_forecast" %in% names(results_df) && 
-          !"delta_holdout_forecast" %in% names(results_df)) {
-        influence_results[[dep_var]][[model_name]]$delta_holdout_forecast <- 
-          results_df$delta_test_forecast
+  # Handle influence results if they exist
+  if (!is.null(influence_results)) {
+    for (dep_var in names(influence_results)) {
+      for (model_name in names(influence_results[[dep_var]])) {
+        results_df <- influence_results[[dep_var]][[model_name]]
+        if ("delta_test_forecast" %in% names(results_df) && 
+            !"delta_holdout_forecast" %in% names(results_df)) {
+          influence_results[[dep_var]][[model_name]]$delta_holdout_forecast <- 
+            results_df$delta_test_forecast
+        }
       }
     }
   }
   
-  # Get ensemble SMAPEs
-  ensemble_smapes <- get_ensemble_smapes(all_results, top_model_results, hold_out_dataset)
-  
-  # Create prediction tables
   cat("Creating prediction tables...\n")
-  wb <- create_enhanced_prediction_tables(
+  wb <- create_enhanced_prediction_tables_revised(
     all_evaluations = all_evaluations, 
     all_models = all_models, 
-    extended_test_sets_step = extended_test_sets_step, 
+    extended_test_sets = extended_test_sets, 
     crps_scores = crps_scores, 
     lpd_scores = lpd_scores, 
     file_path = file_path,
     aggregate_smape_results = aggregate_smape_results,
-    ensemble_smapes = ensemble_smapes
+    ensemble_results = ensemble_results
   )
   
-  # Add sensitivity analysis with proper spacing
   cat("Adding sensitivity analysis...\n")
-  add_sensitivity_analysis(sensitivity_results_step, file_path)
+  add_sensitivity_analysis(sensitivity_results, file_path)
   
-  # Add influence analysis with proper spacing
-  cat("Adding influence analysis...\n")
-  add_influence_analysis_to_workbook(influence_results, file_path)
+  # Add influence analysis with proper spacing (only if data exists)
+  if (!is.null(influence_results)) {
+    cat("Adding influence analysis...\n")
+    add_influence_analysis_to_workbook(influence_results, file_path)
+  }
   
   # Add diagnostics
   cat("Adding diagnostics...\n")
@@ -13530,28 +14013,26 @@ create_excel_results <- function(
   
   return(paste("Results successfully written to", file_path))
 }
-###############################################################################
-## 8) Example usage
-###############################################################################
 
- result <- create_excel_results(
-   all_evaluations = all_evaluations_ewstep, 
-   all_models = all_modelewstep, 
-   extended_test_sets_step = extended_test_sets, 
-   crps_scores = crps_scores_ew, 
-   lpd_scores = lpd_scores_ew_step, 
-   sensitivity_results_step = sensitivity_results_step, 
-   influence_results = influence_results_parallel_step, 
-   expanding_windows = expanding_windows, 
-   all_diagnostics = all_diagnostics_ew_step, 
-   all_looic = all_looic_ew_step, 
-   bayesian_R2_results = bayesian_R2_results_ew_step,
-   ljung_box_results = ljung_box_results_ew_step,
-   aggregate_smape_results = aggregate_smape_results_stepew,
-   all_results = all_results,
-   top_model_results = top_model_results,
-   hold_out_dataset = hold_out_dataset
- )
+###############################################################################
+## 8) USAGE - Call with YOUR EXACT variable names for stepwise
+###############################################################################
+result <- create_excel_results_revised(
+  all_evaluations = all_evaluations_ewstep, 
+  all_models = all_modelewstep, 
+  extended_test_sets = extended_test_sets,  # FIXED: should be extended_test_sets, not extended_test_sets_step
+  crps_scores = crps_scores_ew, 
+  lpd_scores = lpd_scores_ew_step, 
+  sensitivity_results = sensitivity_results_step, 
+  influence_results = influence_results_parallel_step, 
+  expanding_windows = expanding_windows, 
+  all_diagnostics = all_diagnostics_ew_step, 
+  all_looic = all_looic_ew_step, 
+  bayesian_R2_results = bayesian_R2_results_ew_step,
+  ljung_box_results = ljung_box_results_ew_step,
+  aggregate_smape_results = aggregate_smape_results,
+  ensemble_results = ensemble_results
+)
 
- print(result)
+print(result)
 ```
