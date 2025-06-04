@@ -25,7 +25,7 @@ library(ggplot2)
 
 # Data Import and Cleaning
 ```{r}
-filepath <- "C:/Users/yatin/Desktop/Wells Fargo FS Q1-97 to Q4-24 Consolidation V3.0.xlsx"
+file_path <- "Wells Fargo FS Q1-97 to Q4-24 Consolidation V3.0.xlsm"
 mydata <- read_excel(
   path = filepath,
   sheet = "Consolidation Sheet",
